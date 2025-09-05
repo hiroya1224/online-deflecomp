@@ -66,6 +66,9 @@ echo "==> install deps in safe order (known-good combo)"
 "${VPIP}" install "scikit-robot>=0.0.36"
 # 5) ikpy==3.4.2
 "${VPIP}" install "ikpy==3.4.2"
+# 6) online_deflecomp
+"${VPIP}" install -e .
+
 
 
 echo "==> compute site-packages dir (for guard)"
@@ -95,13 +98,14 @@ PY
 
 echo "==> sanity import test (use 'import pinocchio')"
 "${VPY}" - <<'PY'
-import sys, numpy, pinocchio, skrobot, scipy, matplotlib, ikpy
+import sys, numpy, pinocchio, skrobot, scipy, matplotlib, ikpy, online_deflecomp
 print("numpy :", numpy.__version__, numpy.__file__)
 print("pino  :", pinocchio.__version__)
 print("skrob :", skrobot.__version__)
 print("scipy :", scipy.__version__)
 print("mpl   :", matplotlib.__version__)
 print("ikpy  :", ikpy.__version__)
+print("online_deflecomp  :", online_deflecomp.__version__)
 print("env ok")
 PY
 

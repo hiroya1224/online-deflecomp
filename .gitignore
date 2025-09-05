@@ -1,0 +1,15 @@
+# virtual env
+.venv/
+.venv2/
+.python-version
+
+# python cache
+__pycache__/
+*.pyc
+
+# notebooks / tools caches
+.ipynb_checkpoints/
+.pytest_cache/
+
+# misc
+.DS_Store

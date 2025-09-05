@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: online-deflecomp
+Version: 0.1.0
+Summary: Online deflection compensation (deflecomp): multi-frame gravity-direction likelihood + Weird EKF
+Author: Your Name
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.21
+Requires-Dist: scipy>=1.7
+Requires-Dist: matplotlib>=3.4
+Requires-Dist: ikpy>=3.0
+Dynamic: license-file
+
+# online-deflecomp
+
+Library-only package.

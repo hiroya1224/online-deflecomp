@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "online-deflecomp"
+version = "0.1.0"
+description = "Online deflection compensation (deflecomp): multi-frame gravity-direction likelihood + Weird EKF"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name="Your Name"}]
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "matplotlib>=3.4",
+    "ikpy>=3.0"
+    # NOTE: 'pinocchio' must be provided by the environment.
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

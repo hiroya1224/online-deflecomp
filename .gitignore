@@ -6,6 +6,7 @@
 # python cache
 __pycache__/
 *.pyc
+*.egg-info/
 
 # notebooks / tools caches
 .ipynb_checkpoints/

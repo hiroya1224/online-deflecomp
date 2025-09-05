@@ -1,0 +1,6 @@
+numpy==1.26.4
+scipy==1.13.*
+matplotlib==3.9.*
+pin==2.7.*
+scikit-robot>=0.0.36
+ikpy==3.4.2

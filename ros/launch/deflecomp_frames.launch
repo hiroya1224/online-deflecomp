@@ -1,0 +1,33 @@
+<launch>
+  <arg name="urdf_path" default="$(env PWD)/simple6r.urdf"/>
+  <arg name="dt" default="0.004"/>
+
+  <group ns="ref">
+    <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
+    <node pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" name="jsp_gui" output="screen">
+      <remap from="/joint_states" to="/joint_states_ref"/>
+    </node>
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_ref" output="screen">
+      <param name="frame_prefix" value="ref_"/>
+      <remap from="/joint_states" to="/joint_states_ref"/>
+    </node>
+  </group>
+
+  <group ns="cmd">
+    <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_cmd" output="screen">
+      <param name="frame_prefix" value="cmd_"/>
+      <remap from="/joint_states" to="/joint_states_cmd"/>
+    </node>
+  </group>
+
+  <group ns="equil">
+    <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_equil" output="screen">
+      <param name="frame_prefix" value="eq_"/>
+      <remap from="/joint_states" to="/joint_states_equil"/>
+    </node>
+  </group>
+
+  <node pkg="rviz" type="rviz" name="rviz" args="-d $(env PWD)/ros/rviz/deflecomp.rviz" required="false" />
+</launch>

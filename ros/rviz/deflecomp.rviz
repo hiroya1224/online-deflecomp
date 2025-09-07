@@ -193,19 +193,47 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        base_link:
+        cmd/base_link:
           Value: true
-        link1:
+        cmd/link1:
           Value: true
-        link2:
+        cmd/link2:
           Value: true
-        link3:
+        cmd/link3:
           Value: true
-        link4:
+        cmd/link4:
           Value: true
-        link5:
+        cmd/link5:
           Value: true
-        link6:
+        cmd/link6:
+          Value: true
+        equil/base_link:
+          Value: true
+        equil/link1:
+          Value: true
+        equil/link2:
+          Value: true
+        equil/link3:
+          Value: true
+        equil/link4:
+          Value: true
+        equil/link5:
+          Value: true
+        equil/link6:
+          Value: true
+        ref/base_link:
+          Value: true
+        ref/link1:
+          Value: true
+        ref/link2:
+          Value: true
+        ref/link3:
+          Value: true
+        ref/link4:
+          Value: true
+        ref/link5:
+          Value: true
+        ref/link6:
           Value: true
       Marker Alpha: 1
       Marker Scale: 1
@@ -214,13 +242,29 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Tree:
-        base_link:
-          link1:
-            link2:
-              link3:
-                link4:
-                  link5:
-                    link6:
+        ref/base_link:
+          cmd/base_link:
+            cmd/link1:
+              cmd/link2:
+                cmd/link3:
+                  cmd/link4:
+                    cmd/link5:
+                      cmd/link6:
+                        {}
+          equil/base_link:
+            equil/link1:
+              equil/link2:
+                equil/link3:
+                  equil/link4:
+                    equil/link5:
+                      equil/link6:
+                        {}
+          ref/link1:
+            ref/link2:
+              ref/link3:
+                ref/link4:
+                  ref/link5:
+                    ref/link6:
                       {}
       Update Interval: 0
       Value: true
@@ -228,7 +272,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Default Light: true
-    Fixed Frame: base_link
+    Fixed Frame: ref/base_link
     Frame Rate: 30
   Name: root
   Tools:
@@ -252,7 +296,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 4.644041061401367
+      Distance: 2.666421890258789
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -268,9 +312,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5253984332084656
+      Pitch: 0.515398383140564
       Target Frame: <Fixed Frame>
-      Yaw: 0.8253981471061707
+      Yaw: 1.2603981494903564
     Saved: ~
 Window Geometry:
   Displays:
@@ -282,5 +326,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 975
-  X: 122
-  Y: 77
+  X: 471
+  Y: 273

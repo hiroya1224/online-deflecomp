@@ -1,30 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import argparse, re, rospy
+import argparse
+import xml.etree.ElementTree as ET
+import rospy
 
-def add_prefix_to_urdf(urdf_text: str, prefix: str) -> str:
-    def repl_link(m): return f'{m.group(1)}="{prefix}{m.group(2)}"'
-    text = re.sub(r'(<\s*link\s+name\s*=\s*")([^"]+)(")', lambda m: f'{m.group(1)}{prefix}{m.group(2)}{m.group(3)}', urdf_text)
-    text = re.sub(r'(<\s*joint\s+name\s*=\s*")([^"]+)(")', lambda m: f'{m.group(1)}{prefix}{m.group(2)}{m.group(3)}', text)
-    text = re.sub(r'(<\s*parent\s+link\s*=\s*")([^"]+)(")', repl_link, text)
-    text = re.sub(r'(<\s*child\s+link\s*=\s*")([^"]+)(")', repl_link, text)
-    return text
+def add_prefix_tree(root: ET.Element, prefix: str) -> ET.Element:
+    def pref(s: str) -> str:
+        return s if s.startswith(prefix) else prefix + s
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--urdf", dest="urdf_path", type=str, required=True)
-    p.add_argument("--prefixes", type=str, default="ref_,cmd_,eq_")
-    args = p.parse_args()
+    # link name
+    for link in root.findall(".//link"):
+        name = link.get("name")
+        if name:
+            link.set("name", pref(name))
 
-    with open(args.urdf_path, "r") as f:
-        urdf_text = f.read()
+    # joint name + parent/child link
+    for joint in root.findall(".//joint"):
+        jn = joint.get("name")
+        if jn:
+            joint.set("name", pref(jn))
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is not None and parent.get("link"):
+            parent.set("link", pref(parent.get("link")))
+        if child is not None and child.get("link"):
+            child.set("link", pref(child.get("link")))
+    return root
 
-    rospy.init_node("publish_robot_description", anonymous=True)
-    for pref in [s for s in args.prefixes.split(",") if s.strip()]:
-        ns = pref[:-1] if pref.endswith("_") else pref
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--urdf", required=True, help="path to original URDF (no prefix)")
+    ap.add_argument("--prefixes", default="ref_,cmd_,eq_", help="comma-separated, e.g., ref_,cmd_,eq_")
+    args = ap.parse_args()
+
+    tree = ET.parse(args.urdf)
+    base_root = tree.getroot()
+
+    rospy.init_node("publish_robot_description_prefixed", anonymous=True)
+    for p in [s for s in args.prefixes.split(",") if s.strip()]:
+        # deep copy element tree
+        root = ET.fromstring(ET.tostring(base_root, encoding="utf-8"))
+        root = add_prefix_tree(root, p)
+        xml_str = ET.tostring(root, encoding="unicode")
+        ns = p[:-1] if p.endswith("_") else p
         param = f"/{ns}/robot_description"
-        rospy.set_param(param, add_prefix_to_urdf(urdf_text, pref))
-        rospy.loginfo("set %s (prefix='%s')", param, pref)
+        rospy.set_param(param, xml_str)
+        rospy.loginfo("set %s (prefix='%s')", param, p)
 
 if __name__ == "__main__":
     main()

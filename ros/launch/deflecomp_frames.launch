@@ -1,33 +1,51 @@
 <launch>
   <arg name="urdf_path" default="$(env PWD)/simple6r.urdf"/>
-  <arg name="dt" default="0.004"/>
 
+  <!-- Reference -->
   <group ns="ref">
+    <!-- URDF を /ref/robot_description にロード -->
     <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
+    <!-- GUI（相対：joint_states → 絶対：/ref/joint_states） -->
     <node pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" name="jsp_gui" output="screen">
-      <remap from="/joint_states" to="/joint_states_ref"/>
+      <remap from="joint_states" to="/ref/joint_states"/>
     </node>
+    <!-- RSP：tf_prefix=ref で TF を ref/* に分離 -->
     <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_ref" output="screen">
-      <param name="frame_prefix" value="ref_"/>
-      <remap from="/joint_states" to="/joint_states_ref"/>
+      <param name="tf_prefix" value="ref"/>
+      <param name="ignore_timestamp" value="true"/>
+      <remap from="joint_states" to="/ref/joint_states"/>
     </node>
   </group>
 
+  <!-- Command -->
   <group ns="cmd">
     <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
     <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_cmd" output="screen">
-      <param name="frame_prefix" value="cmd_"/>
-      <remap from="/joint_states" to="/joint_states_cmd"/>
+      <param name="tf_prefix" value="cmd"/>
+      <param name="ignore_timestamp" value="true"/>
+      <remap from="joint_states" to="/cmd/joint_states"/>
     </node>
   </group>
 
+  <!-- Equilibrium -->
   <group ns="equil">
     <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
     <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_equil" output="screen">
-      <param name="frame_prefix" value="eq_"/>
-      <remap from="/joint_states" to="/joint_states_equil"/>
+      <param name="tf_prefix" value="equil"/>
+      <param name="ignore_timestamp" value="true"/>
+      <remap from="joint_states" to="/equil/joint_states"/>
     </node>
   </group>
 
+  <!-- （任意）3体を並べたい場合は base_link 間に静的変換を置く -->
+  <!-- <node pkg="tf2_ros" type="static_transform_publisher" name="offset_cmd"
+        args="0.4 0 0 0 0 0 ref/base_link cmd/base_link" /> -->
+  <!-- <node pkg="tf2_ros" type="static_transform_publisher" name="offset_equil"
+        args="0.8 0 0 0 0 0 ref/base_link equil/base_link" /> -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="st_cmd_to_ref"
+        args="0 0 0 0 0 0 ref/base_link cmd/base_link" />
+  <node pkg="tf2_ros" type="static_transform_publisher" name="st_equil_to_ref"
+        args="0 0 0 0 0 0 ref/base_link equil/base_link" />
+        
   <node pkg="rviz" type="rviz" name="rviz" args="-d $(env PWD)/ros/rviz/deflecomp.rviz" required="false" />
 </launch>

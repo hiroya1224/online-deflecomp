@@ -80,9 +80,9 @@ def main() -> None:
     p.add_argument("--zeta", type=float, default=0.03)
     p.add_argument("--vel", type=float, default=5.0)
     p.add_argument("--strip-prefix-ref", type=str, default="")
-    p.add_argument("--topic-ref", type=str, default="/joint_states_ref")
-    p.add_argument("--topic-cmd", type=str, default="/joint_states_cmd")
-    p.add_argument("--topic-equil", type=str, default="/joint_states_equil")
+    p.add_argument("--topic-ref", type=str, default="/ref/joint_states")
+    p.add_argument("--topic-cmd", type=str, default="/cmd/joint_states")
+    p.add_argument("--topic-equil", type=str, default="/equil/joint_states")
     args = p.parse_args()
     kp_list = [float(x) for x in args.kp.split(",") if x.strip()]
 

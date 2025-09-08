@@ -3,9 +3,17 @@ Panels:
     Help Height: 70
     Name: Displays
     Property Tree Widget:
-      Expanded: ~
-      Splitter Ratio: 0.5
-    Tree Height: 286
+      Expanded:
+        - /TF1
+        - /TF1/Tree1
+        - /TF1/Tree1/ref/base_link1
+        - /TF1/Tree1/ref/base_link1/cmd/base_link1/cmd/link11
+        - /TF1/Tree1/ref/base_link1/cmd/base_link1/cmd/link11/cmd/link21
+        - /TF1/Tree1/ref/base_link1/cmd/base_link1/cmd/link11/cmd/link21/cmd/link31
+        - /TF1/Tree1/ref/base_link1/cmd/base_link1/cmd/link11/cmd/link21/cmd/link31/cmd/link41
+        - /TF1/Tree1/ref/base_link1/cmd/base_link1/cmd/link11/cmd/link21/cmd/link31/cmd/link41/cmd/link51
+      Splitter Ratio: 0.8362573385238647
+    Tree Height: 603
   - Class: rviz/Views
     Expanded:
       - /Current View1
@@ -312,19 +320,19 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.515398383140564
+      Pitch: 0.4403986930847168
       Target Frame: <Fixed Frame>
-      Yaw: 1.2603981494903564
+      Yaw: 4.630401611328125
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 823
+  Height: 1376
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd000000010000000000000158000002ddfc0200000002fb000000100044006900730070006c006100790073010000003d000001a1000000c900fffffffb0000000a0056006900650077007301000001e400000136000000a400ffffff00000271000002dd00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000015800000506fc0200000002fb000000100044006900730070006c006100790073010000003d000002de000000c900fffffffb0000000a00560069006500770073010000032100000222000000a400ffffff0000085a0000050600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 975
-  X: 471
-  Y: 273
+  Width: 2488
+  X: 72
+  Y: 27

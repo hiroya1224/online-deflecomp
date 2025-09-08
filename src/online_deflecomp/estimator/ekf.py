@@ -52,7 +52,7 @@ class MultiFrameWeirdEKF:
             return H0s - (lam_max_H + self.eps_def) * np.eye(H0s.shape[0])
 
         c = -2.0 * (lam_max_H + self.eps_def) / lam_max_B
-        return H0s + 0.5 * c * MtM_total
+        return H0s + 0.5 * c * MtM_total, c
 
     def _grad_hess_multi(self, solver: EquilibriumSolver, x0: np.ndarray, theta_cmd: np.ndarray, A_map: Dict[int, np.ndarray], robot_est: RobotArm, theta_init: Optional[np.ndarray]):
         n = x0.size
@@ -73,26 +73,34 @@ class MultiFrameWeirdEKF:
 
         y = np.linalg.pinv(J_q.T, rcond=1e-12) @ u_total
         g = -(J_x.T @ y)
-        H = self._stabilize_hessian(H0_total, MtM_total)
-        return g, H, theta_eq
+        H, c_bingham = self._stabilize_hessian(H0_total, MtM_total)
+        return g, H, theta_eq, c_bingham
 
-    def update_with_multi(self, solver: EquilibriumSolver, theta_cmd: np.ndarray, A_map: Dict[int, np.ndarray], robot_est: RobotArm, theta_init_eq_pred: Optional[np.ndarray]) -> np.ndarray:
+    def update_with_multi(self, solver: EquilibriumSolver, theta_cmd: np.ndarray, A_map: Dict[int, np.ndarray], robot_est: RobotArm, theta_init_eq_pred: Optional[np.ndarray], kp_lim: Tuple[float]) -> np.ndarray:
         self.predict()
-        g, H, theta_eq = self._grad_hess_multi(solver=solver, x0=self.x, theta_cmd=theta_cmd, A_map=A_map, robot_est=robot_est, theta_init=theta_init_eq_pred)
+        g, H, theta_eq, c_bingham = self._grad_hess_multi(solver=solver, x0=self.x, theta_cmd=theta_cmd, A_map=A_map, robot_est=robot_est, theta_init=theta_init_eq_pred)
         Sinv = -H
         w = np.linalg.eigvalsh(0.5 * (Sinv + Sinv.T))
         lam_min = float(np.min(w))
         if lam_min <= self.eps_def:
             Sinv = Sinv + ((self.eps_def - lam_min) + 1e-12) * np.eye(Sinv.shape[0])
 
-        S = np.linalg.pinv(Sinv, rcond=1e-12)
-        m = self.x + S @ g
+        # S = np.linalg.pinv(Sinv, rcond=1e-12)
+        # m = self.x + S @ g
 
         Pinv = np.linalg.pinv(self.P, rcond=1e-12)
-        J_post = Pinv + Sinv
-        P_post = np.linalg.pinv(J_post, rcond=1e-12)
-        h_post = Pinv @ self.x + Sinv @ m
-        x_post = P_post @ h_post
+        # J_post = Pinv + Sinv
+        # P_post = np.linalg.pinv(J_post, rcond=1e-12)
+        # h_post = Pinv @ self.x + Sinv @ m
+        # x_post = P_post @ h_post
+
+        # 等価な一行更新（丸め誤差的にも綺麗）
+        lam = 1e-6
+        P_post = np.linalg.pinv(Pinv + Sinv + lam*np.eye(Sinv.shape[0]), rcond=1e-12)
+        x_post = self.x + P_post @ g
+
+        ## clip
+        x_post = np.clip(x_post, np.log(kp_lim[0]), np.log(kp_lim[1]))
 
         self.P = 0.5 * (P_post + P_post.T)
         self.x = x_post

@@ -8,6 +8,7 @@
     <!-- GUI（相対：joint_states → 絶対：/ref/joint_states） -->
     <node pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" name="jsp_gui" output="screen">
       <remap from="joint_states" to="/ref/joint_states"/>
+      <param name="rate" value="50" />
     </node>
     <!-- RSP：tf_prefix=ref で TF を ref/* に分離 -->
     <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp_ref" output="screen">

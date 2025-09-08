@@ -8,7 +8,7 @@ from sensor_msgs.msg import JointState
 
 # local lib (no catkin dependency)
 sys.path.append(os.path.join(os.path.dirname(__file__), "lib"))
-from dynamic_simulator import DynamicSimulator, DynamicParams  # noqa: E402
+from online_deflecomp.simulation.dynamic_simulator import DynamicSimulator, DynamicParams  # noqa: E402
 
 from online_deflecomp.utils.robot import RobotArm
 from online_deflecomp.controller.command import theta_cmd_from_theta_ref
@@ -76,8 +76,8 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--urdf", dest="urdf_path", type=str, required=True)
     p.add_argument("--dt", type=float, default=0.004)
-    p.add_argument("--kp", type=str, default="18,12,14,9,7,5")
-    p.add_argument("--zeta", type=float, default=0.03)
+    p.add_argument("--kp", type=str, default="50,50,50,50,50,50")
+    p.add_argument("--zeta", type=float, default=0.999)
     p.add_argument("--vel", type=float, default=5.0)
     p.add_argument("--strip-prefix-ref", type=str, default="")
     p.add_argument("--topic-ref", type=str, default="/ref/joint_states")

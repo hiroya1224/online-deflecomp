@@ -145,40 +145,30 @@ class DynamicSimulator:
             if tau_ext.shape != (n,):
                 raise ValueError(f"tau_ext must have shape ({n},), got {tau_ext.shape}")
 
-        # Mass matrix M(q) and non-linear effects b(q, qd) = C(q,qd)qd + g(q)
+        # M(q)
         M = pin.crba(self.robot.model, self.robot.data, self.q)
-        M = 0.5 * (M + M.T)  # ensure symmetry
-        b = pin.nonLinearEffects(self.robot.model, self.robot.data, self.q, self.qd)
+        M = 0.5 * (M + M.T)
 
-        # Virtual spring-damper actuator torque
-        tau_act = -self.params.K * (self.q - q_ref) - self.D * self.qd
-        tau_total = tau_ext + tau_act
+        # b(q,qd) = C(q,qd) + g(q)  ← RNEAで取得（qdd=0）
+        b = pin.rnea(self.robot.model, self.robot.data, self.q, self.qd, np.zeros(n, dtype=float))
 
-        rhs = tau_total - b
+        # spring-damper torque: K(θ_cmd - q) - D qd   ※“K(θ_cmd - q)”に統一
+        tau_spring = self.params.K * (q_ref - self.q) - self.D * self.qd
 
-        # qdd = M^{-1} rhs (pinv for robustness if requested)
-        if self.params.use_pinv:
-            Minv = np.linalg.pinv(M, rcond=1e-12)
-            qdd = Minv @ rhs
-        else:
-            # Solve (more accurate/faster if M well-conditioned)
-            qdd = np.linalg.solve(M, rhs)
+        # M qdd = tau_ext + tau_spring - b
+        rhs = (tau_ext + tau_spring) - b
+        qdd = np.linalg.pinv(M, rcond=1e-12) @ rhs  # or np.linalg.solve
 
-        # Semi-implicit Euler
         qd_next = self.qd + dt * qdd
         if self.vel_lim is not None:
             vlim = np.asarray(self.vel_lim, dtype=float)
             qd_next = np.clip(qd_next, -np.abs(vlim), np.abs(vlim))
-
         q_next = self.q + dt * qd_next
 
-        # Position limits (clamp)
         if self.pos_lo is not None and self.pos_hi is not None:
             q_next = np.minimum(np.maximum(q_next, self.pos_lo), self.pos_hi)
 
-        # Commit
-        self.q = q_next
-        self.qd = qd_next
+        self.q, self.qd = q_next, qd_next
         return q_next.copy(), qd_next.copy()
 
     # ---------------------- helpers ----------------------

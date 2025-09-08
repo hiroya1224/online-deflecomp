@@ -41,18 +41,16 @@ class RobotArm:
         return J6[3:6, :]
 
     def gravity_dir_in_frame(self, theta: np.ndarray, g_base: np.ndarray, fid: int) -> np.ndarray:
-        R_bf = self.frame_rotation_in_base(theta, fid)
-        gb = g_base / (np.linalg.norm(g_base) + 1e-12)
-        gf = R_bf @ gb
+        # NOTE: Despite the argument name `g_base`, this function now interprets the input
+        # as the gravity vector expressed in the WORLD frame and returns the unit gravity
+        # direction expressed in the *frame* coordinates. This change is to ensure consistency
+        # with the Bingham construction which compares WORLD gravity to the link-frame gravity.
+        # (Function name is kept for compatibility; do NOT rename.)
+        self._fk_update(theta)
+        R_wf = self.data.oMf[fid].rotation
+        gw = g_base / (np.linalg.norm(g_base) + 1e-12)
+        gf = R_wf.T @ gw
         return gf / (np.linalg.norm(gf) + 1e-12)
-
-    def fk_pose(self, theta: np.ndarray) -> pin.SE3:
-        self._fk_update(theta)
-        return pin.SE3(self.data.oMf[self.tip_fid])
-
-    def joint_transforms(self, theta: np.ndarray) -> list:
-        self._fk_update(theta)
-        Ts = [pin.SE3(self.data.oMi[jid]) for jid in range(1, self.model.njoints)]
         Ts.append(pin.SE3(self.data.oMf[self.tip_fid]))
         return Ts
 

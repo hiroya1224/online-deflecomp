@@ -211,7 +211,7 @@ class EstimatorNode:
             g_f = buf.interpolate(t_align)
             if g_f is None:
                 continue
-            A_map[self.frame_ids[nm]] = simple_bingham_unit(self.g_unit, g_f, parameter=self.A_param)
+            A_map[self.frame_ids[nm]] = simple_bingham_unit(g_f, self.g_unit, parameter=self.A_param)  # NOTE: flipped args for world-relative rotation (frame->world).
             ok = True
         return A_map if ok else None
 

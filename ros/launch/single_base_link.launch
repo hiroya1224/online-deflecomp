@@ -1,0 +1,21 @@
+<launch>
+  <arg name="urdf_path" default="$(env PWD)/simple6r.urdf"/>
+
+  <!-- URDF をそのまま /robot_description に読み込み -->
+  <rosparam param="robot_description" command="load" file="$(arg urdf_path)"/>
+
+  <!-- 参照用 JointState GUI -->
+  <node pkg="joint_state_publisher_gui" type="joint_state_publisher_gui" name="jsp_gui" output="screen">
+    <remap from="/joint_states" to="/joint_states_ref"/>
+  </node>
+
+  <!-- RSP: base_link で TF を出す（frame_prefix は使わない） -->
+  <node pkg="robot_state_publisher" type="robot_state_publisher" name="rsp" output="screen">
+    <param name="publish_frequency" value="60.0"/>
+    <param name="ignore_timestamp" value="true"/>
+    <remap from="/joint_states" to="/joint_states_ref"/>
+  </node>
+
+  <!-- RViz（Fixed Frame は後述の通り base_link に設定） -->
+  <node pkg="rviz" type="rviz" name="rviz" />
+</launch>

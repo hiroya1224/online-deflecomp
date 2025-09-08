@@ -26,6 +26,9 @@ class MultiFrameWeirdEKF:
     def _accumulate_frame_terms(self, robot: RobotArm, theta_eq: np.ndarray, fid: int, A_f: np.ndarray, J_q: np.ndarray, J_x: np.ndarray):
         z_f = robot.frame_quaternion_wxyz_base(theta_eq, fid)
         Qz_f = BinghamUtils.qmat_from_quat_wxyz(z_f)
+        # NOTE: z_f represents frame->WORLD (body-to-world) rotation.
+        # Qz is G(z) for WORLD angular velocity; keep A_f built as simple_bingham_unit(g_in_frame, g_in_world)
+        # so v_f = Qz^T (A_f z_f) and H0_f = 0.5 M_f^T A_f M_f remain consistent.
         J_w_f = robot.frame_angular_jacobian_world(theta_eq, fid)
 
         v_f = Qz_f.T @ (A_f @ z_f)

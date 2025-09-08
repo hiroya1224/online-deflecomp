@@ -95,6 +95,7 @@ class MultiFrameWeirdEKF:
         # x_post = P_post @ h_post
 
         # 等価な一行更新（丸め誤差的にも綺麗）
+        # lam = ||x - x_prev|| を小さくする regularize factor
         lam = 1e-6
         P_post = np.linalg.pinv(Pinv + Sinv + lam*np.eye(Sinv.shape[0]), rcond=1e-12)
         x_post = self.x + P_post @ g

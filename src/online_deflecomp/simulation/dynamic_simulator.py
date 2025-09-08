@@ -1,8 +1,9 @@
 # ros/lib/dynamic_simulator.py
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal  # ← Literal を追加
 import numpy as np
 import pinocchio as pin
+from online_deflecomp.controller.equilibrium import EquilibriumSolver, EquilibriumConfig
 
 @dataclass
 class DynamicParams:
@@ -16,13 +17,24 @@ class DynamicParams:
     limit_position_high: Optional[np.ndarray] = None
     # new:
     integrator: str = "rk4"              # "rk4" or "semi_implicit_euler"
-    ref_tau: Optional[float] = 0.03      # [s] 1st-order low-pass for q_ref (None/<=0 to disable)
-    ref_max_vel: Optional[float] = 4.0   # [rad/s] slew limit for q_ref (None to disable)
+    ref_tau: Optional[float] = 1e-4      # [s] 1st-order low-pass for q_ref (None/<=0 to disable)
+    ref_max_vel: Optional[float] = 10.0  # [rad/s] slew limit for q_ref (None to disable)
+
+    # ---- ここから追記 ----
+    # 平衡点直行きモード：
+    #   "dynamic"      … 従来どおりの慣性ありダイナミクス
+    #   "relax_to_eq"  … 毎ステップ平衡点 q_eq を解き、一次遅れで q に反映（時定数 tau_eq）
+    #   "quasistatic"  … 平衡点 q_eq に即ジャンプ（瞬時収束）
+    eq_mode: Literal["dynamic", "relax_to_eq", "quasistatic"] = "dynamic"
+    tau_eq: Optional[float] = 0.05       # [s] relax_to_eq の時定数（None/<=0 は 0.05 と同等）
+    # ---- 追記ここまで ----
+
 
 class DynamicSimulator:
     def __init__(self, robot, params: DynamicParams) -> None:
         self.robot = robot
         self.params = params
+
         n = self.robot.nv
         if params.K.shape != (n,):
             raise ValueError(f"K must have shape ({n},), got {params.K.shape}")
@@ -51,8 +63,26 @@ class DynamicSimulator:
         self.pos_hi = params.limit_position_high if params.limit_position_high is not None else (hi if hi.shape[0] == n else None)
 
         # reference shaping states
-        self.q_ref_filt = np.zeros(n, dtype=float)
-        self.q_ref_prev = np.zeros(n, dtype=float)
+        self.q_ref_filt = self.q.copy()
+        self.q_ref_prev = self.q.copy()
+
+        # ---- ここから追記：任意の平衡点ソルバを後付け可能に ----
+        self.eq_solver = EquilibriumSolver(EquilibriumConfig(maxiter=80))  # 任意: 外側から set_eq_solver() で注入
+        # ---- 追記ここまで ----
+
+    # ---- ここから追記：平衡点ソルバの setter とフォールバック実装 ----
+    def set_eq_solver(self, solver) -> None:
+        """Inject external equilibrium solver object with .solve(theta_cmd, kp_vec, theta_init)."""
+        self.eq_solver = solver
+
+    def _solve_equilibrium(self, theta_cmd: np.ndarray, kp_vec: np.ndarray, q_init: np.ndarray) -> np.ndarray:
+        """Return q_eq for given theta_cmd, using external solver if provided."""
+        # if self.eq_solver is not None and hasattr(self.eq_solver, "solve"):
+        return self.eq_solver.solve(self.robot, theta_cmd=theta_cmd, kp_vec=kp_vec, theta_init=q_init)
+        # fallback: RobotArm の既存 S^1-Newton
+        # return self.robot.equilibrium_s1(theta_cmd, kp_vec, maxiter=80, theta_init=q_init)
+    # ---- 追記ここまで ----
+
 
     def reset(self, q: Optional[np.ndarray] = None, qd: Optional[np.ndarray] = None) -> None:
         n = self.robot.nv
@@ -106,7 +136,33 @@ class DynamicSimulator:
         n = self.robot.nv
         if q_ref.shape != (n,):
             raise ValueError(f"q_ref must have shape ({n},), got {q_ref.shape}")
-        
+        # ---- ここから追記：平衡点直行きモード ----
+        mode = getattr(self.params, "eq_mode", "dynamic")
+        if mode in ("quasistatic", "relax_to_eq"):
+            kp_vec = self.params.K
+            q_init = self.q  # warm start
+            q_eq = self._solve_equilibrium(theta_cmd=q_ref, kp_vec=kp_vec, q_init=q_init)
+
+            if mode == "quasistatic":
+                q_next = q_eq
+                qd_next = np.zeros_like(q_eq)
+            else:
+                tau = float(self.params.tau_eq if (self.params.tau_eq is not None and self.params.tau_eq > 0.0) else 0.05)
+                alpha = 1.0 - float(np.exp(-dt / max(tau, 1e-6)))
+                q_next = self.q + alpha * (q_eq - self.q)
+                qd_next = (q_next - self.q) / max(dt, 1e-9)
+                if self.vel_lim is not None:
+                    vlim = np.asarray(self.vel_lim, dtype=float)
+                    qd_next = np.clip(qd_next, -np.abs(vlim), np.abs(vlim))
+                    q_next = self.q + qd_next * dt
+
+            if self.pos_lo is not None and self.pos_hi is not None:
+                q_next = np.minimum(np.maximum(q_next, self.pos_lo), self.pos_hi)
+
+            self.q, self.qd = q_next, qd_next
+            return q_next.copy(), qd_next.copy()
+        # ---- 追記ここまで ----
+
         # add noise (simulating motor vibration)
         q_ref = q_ref + np.random.randn(q_ref.shape[0]) * 5 * np.pi/180
 

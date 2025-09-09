@@ -11,7 +11,7 @@ from sensor_msgs.msg import JointState, Imu
 from std_msgs.msg import Float64MultiArray
 
 from online_deflecomp.utils.robot import RobotArm
-from online_deflecomp.controller.command import theta_cmd_from_theta_ref
+from online_deflecomp.controller.command import theta_cmd_from_theta_ref, lowpass_theta_cmd
 from online_deflecomp.estimator.ekf import MultiFrameWeirdEKF
 from online_deflecomp.controller.equilibrium import EquilibriumSolver, EquilibriumConfig
 
@@ -135,6 +135,9 @@ class EstimatorNode:
         self.last_cmd: Optional[np.ndarray] = None
         self.last_cmd_t: Optional[float] = None
 
+        # low-pass time constant [s] for theta_cmd
+        self.tau_cmd = rospy.get_param("~theta_cmd_tau", 0.2)
+
         # imu buffers
         self.imu_bufs: Dict[str, ImuBuffer] = {nm: ImuBuffer(maxlen=2000) for nm in self.frames}
 
@@ -190,7 +193,13 @@ class EstimatorNode:
 
         # (2) 現在の Kp_hat と θ_ref から新しい θ_cmd を生成・publish（次サイクルの基準時刻にもなる）
         kp_hat = np.exp(self.wekf.x)
-        theta_cmd = theta_cmd_from_theta_ref(self.robot, self.q_ref, kp_hat)
+        theta_cmd_raw = theta_cmd_from_theta_ref(self.robot, self.q_ref, kp_hat)
+        if self.last_cmd is not None and self.last_cmd_t is not None:
+            dt_cmd = max(0.0, now - self.last_cmd_t)
+            theta_cmd = lowpass_theta_cmd(theta_raw=theta_cmd_raw, theta_prev=self.last_cmd,
+                                         dt=dt_cmd, tau=self.tau_cmd)
+        else:
+            theta_cmd = theta_cmd_raw
         self.last_cmd = theta_cmd.copy()
         self.last_cmd_t = now
 

@@ -51,8 +51,6 @@ class RobotArm:
         gw = g_base / (np.linalg.norm(g_base) + 1e-12)
         gf = R_wf.T @ gw
         return gf / (np.linalg.norm(gf) + 1e-12)
-        Ts.append(pin.SE3(self.data.oMf[self.tip_fid]))
-        return Ts
 
     def tau_gravity(self, theta: np.ndarray) -> np.ndarray:
         return pin.computeGeneralizedGravity(self.model, self.data, theta)
@@ -64,3 +62,7 @@ class RobotArm:
         com = pin.centerOfMass(self.model, self.data, theta)
         g = self.model.gravity.linear
         return -self.total_mass * float(np.dot(g, com))
+    
+    def fk_pose(self, theta: np.ndarray) -> pin.SE3:
+        self._fk_update(theta)
+        return pin.SE3(self.data.oMf[self.tip_fid])

@@ -45,14 +45,14 @@ class MultiFrameWeirdEKF:
         wH = np.linalg.eigvalsh(H0s)
         lam_max_H = float(np.max(wH)) if wH.size > 0 else 0.0
         if lam_max_H <= -self.eps_def:
-            return H0s
+            return H0s, 0.
 
         Bs = 0.5 * (MtM_total + MtM_total.T)
         wB = np.linalg.eigvalsh(Bs)
         lam_max_B = float(np.max(wB)) if wB.size > 0 else 0.0
 
         if lam_max_B <= 1e-12:
-            return H0s - (lam_max_H + self.eps_def) * np.eye(H0s.shape[0])
+            return H0s - (lam_max_H + self.eps_def) * np.eye(H0s.shape[0]), 0.
 
         c = -2.0 * (lam_max_H + self.eps_def) / lam_max_B
         return H0s + 0.5 * c * MtM_total, c
@@ -79,7 +79,10 @@ class MultiFrameWeirdEKF:
         H, c_bingham = self._stabilize_hessian(H0_total, MtM_total)
         return g, H, theta_eq, c_bingham
 
-    def update_with_multi(self, solver: EquilibriumSolver, theta_cmd: np.ndarray, A_map: Dict[int, np.ndarray], robot_est: RobotArm, theta_init_eq_pred: Optional[np.ndarray], kp_lim: Tuple[float]) -> np.ndarray:
+    def update_with_multi(self, solver: EquilibriumSolver, theta_cmd: np.ndarray, A_map: Dict[int, np.ndarray], robot_est: RobotArm, theta_init_eq_pred: Optional[np.ndarray], kp_lim: Optional[Tuple[float]] = None) -> np.ndarray:
+        if kp_lim is None:
+            kp_lim = (1e-10, 2000)
+        
         self.predict()
         g, H, theta_eq, c_bingham = self._grad_hess_multi(solver=solver, x0=self.x, theta_cmd=theta_cmd, A_map=A_map, robot_est=robot_est, theta_init=theta_init_eq_pred)
         Sinv = -H

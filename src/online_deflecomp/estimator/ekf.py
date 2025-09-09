@@ -79,33 +79,93 @@ class MultiFrameWeirdEKF:
         H, c_bingham = self._stabilize_hessian(H0_total, MtM_total)
         return g, H, theta_eq, c_bingham
 
-    def update_with_multi(self, solver: EquilibriumSolver, theta_cmd: np.ndarray, A_map: Dict[int, np.ndarray], robot_est: RobotArm, theta_init_eq_pred: Optional[np.ndarray], kp_lim: Tuple[float]) -> np.ndarray:
+    def update_with_multi(
+        self,
+        solver: EquilibriumSolver,
+        theta_cmd: np.ndarray,
+        A_map: Dict[int, np.ndarray],
+        robot_est: RobotArm,
+        theta_init_eq_pred: Optional[np.ndarray],
+        kp_lim: Tuple[float],
+        theta_ref: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Multi-frame EKF update with Bingham observations.
+        + Command-sensitivity regularization:
+            add  lambda * || J_cmd(x) * dx ||^2  to the LS objective,
+            where  J_cmd = d/dx [ g(Kp) ]  with x = log diag(Kp).
+        Here, g(Kp) is the "update term" in theta_cmd = theta_ref + g(Kp).
+        With the current command rule  g(Kp) = tau_g(theta_ref) / Kp  (elementwise),
+        we have  d g / d x = - diag( g(Kp) ).
+
+        Args:
+            theta_ref: (optional) reference posture used to compute tau_g(theta_ref).
+                    If not provided, we approximate tau_g at theta_init_eq_pred
+                    to form g(Kp) ≈ tau_g(theta_init)/Kp.
+        """
+        # Time update
         self.predict()
-        g, H, theta_eq, c_bingham = self._grad_hess_multi(solver=solver, x0=self.x, theta_cmd=theta_cmd, A_map=A_map, robot_est=robot_est, theta_init=theta_init_eq_pred)
+
+        # Measurement (Bingham) gradient/Hessian, equilibrium theta_eq
+        g, H, theta_eq, _ = self._grad_hess_multi(
+            x0=self.x,
+            solver=solver,
+            theta_cmd=theta_cmd,
+            A_map=A_map,
+            robot_est=robot_est,
+            theta_init=theta_init_eq_pred,
+        )
+
+        # Information matrix from Bingham block (positive semidefinite)
         Sinv = -H
+
+        # ===== Command-sensitivity regularization =====
+        # State is x = log(kp).  kp_vec = exp(x).
+        kp_vec = np.exp(self.x)
+        kp_safe = np.maximum(kp_vec, 1e-12)
+
+        if theta_ref is not None:
+            # exact: g(Kp) = theta_cmd - theta_ref
+            d_cmd = (theta_cmd - theta_ref).astype(float)
+        else:
+            # fallback (no API change needed at call site):
+            # approximate tau_g at theta_init_eq_pred (or theta_cmd as last resort)
+            theta_for_tau = theta_init_eq_pred if theta_init_eq_pred is not None else theta_cmd
+            tau_g_approx = robot_est.tau_gravity(theta_for_tau)
+            d_cmd = (tau_g_approx / kp_safe).astype(float)
+
+        # J_cmd = d g / d x = -diag(d_cmd)  because d/dx (1/exp(x)) = -1
+        J_cmd = -np.diag(d_cmd)
+
+        # Scale-aware weight (dimensionless). Keep small by default.
+        # You can tune alpha if you want stronger damping on the update term.
+        alpha = 1e+1
+        scale = float(np.linalg.norm(d_cmd))
+        lambda_cmd = alpha / max(1.0, scale)
+
+        # Add lambda * J_cmd^T J_cmd  (PSD) to the information matrix.
+        # This damps the part of dx that would amplify the command update term.
+        Sinv = Sinv + lambda_cmd * (J_cmd.T @ J_cmd)
+        # ===== End of regularization =====
+
+        # Symmetrize & minimum-eigenvalue floor for numerical safety
         w = np.linalg.eigvalsh(0.5 * (Sinv + Sinv.T))
         lam_min = float(np.min(w))
         if lam_min <= self.eps_def:
             Sinv = Sinv + ((self.eps_def - lam_min) + 1e-12) * np.eye(Sinv.shape[0])
 
-        # S = np.linalg.pinv(Sinv, rcond=1e-12)
-        # m = self.x + S @ g
-
+        # Prior fusion (information form) with small Tikhonov (same as before)
         Pinv = np.linalg.pinv(self.P, rcond=1e-12)
-        # J_post = Pinv + Sinv
-        # P_post = np.linalg.pinv(J_post, rcond=1e-12)
-        # h_post = Pinv @ self.x + Sinv @ m
-        # x_post = P_post @ h_post
-
-        # 等価な一行更新（丸め誤差的にも綺麗）
-        # lam = ||x - x_prev|| を小さくする regularize factor
         lam = 1e-6
-        P_post = np.linalg.pinv(Pinv + Sinv + lam*np.eye(Sinv.shape[0]), rcond=1e-12)
+        P_post = np.linalg.pinv(Pinv + Sinv + lam * np.eye(Sinv.shape[0]), rcond=1e-12)
+
+        # State update
         x_post = self.x + P_post @ g
 
-        ## clip
+        # Clip to kp limits in log-domain (same as before)
         x_post = np.clip(x_post, np.log(kp_lim[0]), np.log(kp_lim[1]))
 
+        # Commit
         self.P = 0.5 * (P_post + P_post.T)
         self.x = x_post
         self.last_theta_eq = theta_eq.copy()

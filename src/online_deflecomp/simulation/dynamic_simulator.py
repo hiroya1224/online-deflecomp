@@ -15,6 +15,18 @@ class DynamicParams:
     limit_velocity: Optional[np.ndarray] = None
     limit_position_low: Optional[np.ndarray] = None
     limit_position_high: Optional[np.ndarray] = None
+    integrator: str = "rk4"
+    ref_tau: float = 1e-9
+    ref_max_vel: float = 1000.0
+    eq_mode: str = "dynamic"
+    tau_eq: Optional[float] = None
+    # quasi-static perturbation parameters
+    qs_noise_std_deg: float = 0.0
+    qs_vib_amp_deg: float = 0.0
+    qs_vib_freq_hz: float = 50.0
+    qs_vib_axes: Optional[np.ndarray] = None
+    qs_seed: Optional[int] = None
+    limit_position_high: Optional[np.ndarray] = None
     # new:
     integrator: str = "rk4"              # "rk4" or "semi_implicit_euler"
     ref_tau: Optional[float] = 1e-4      # [s] 1st-order low-pass for q_ref (None/<=0 to disable)
@@ -85,6 +97,14 @@ class DynamicSimulator:
 
 
     def reset(self, q: Optional[np.ndarray] = None, qd: Optional[np.ndarray] = None) -> None:
+        # time state for quasi-static vibration/noise
+        if getattr(self, "_rng", None) is None:
+            seed = None if self.params.qs_seed is None else int(self.params.qs_seed)
+            try:
+                self._rng = np.random.default_rng(seed)
+            except Exception:
+                self._rng = np.random.default_rng()
+        self._t = 0.0
         n = self.robot.nv
         self.q = np.zeros(n, dtype=float) if q is None else q.astype(float, copy=True)
         self.qd = np.zeros(n, dtype=float) if qd is None else qd.astype(float, copy=True)
@@ -144,7 +164,35 @@ class DynamicSimulator:
             q_eq = self._solve_equilibrium(theta_cmd=q_ref, kp_vec=kp_vec, q_init=q_init)
 
             if mode == "quasistatic":
-                q_next = q_eq
+                # quasi-static: hold at equilibrium with small noise + vibration
+                self._t = float(self._t + dt)
+                n = q_eq.shape[0]
+                # noise
+                sig = float(max(0.0, self.params.qs_noise_std_deg))
+                noise = np.zeros(n, dtype=float)
+                if sig > 0.0:
+                    noise = self._rng.standard_normal(n) * (np.deg2rad(sig))
+                # vibration
+                amp = float(max(0.0, self.params.qs_vib_amp_deg))
+                vib = np.zeros(n, dtype=float)
+                if amp > 0.0:
+                    freq = float(max(0.0, self.params.qs_vib_freq_hz))
+                    phase = 0.0
+                    s = np.sin(2.0*np.pi*freq*self._t + phase)
+                    vib_vec = np.ones(n, dtype=float) * np.deg2rad(amp) * s
+                    axes = self.params.qs_vib_axes
+                    if axes is not None:
+                        try:
+                            mask = np.zeros(n, dtype=float)
+                            idxs = [int(i) for i in np.array(axes).ravel().tolist()]
+                            idxs = [i for i in idxs if 0 <= i < n]
+                            for i in idxs:
+                                mask[i] = 1.0
+                            vib_vec = vib_vec * mask
+                        except Exception:
+                            pass
+                    vib = vib_vec
+                q_next = q_eq + noise + vib
                 qd_next = np.zeros_like(q_eq)
             else:
                 tau = float(self.params.tau_eq if (self.params.tau_eq is not None and self.params.tau_eq > 0.0) else 0.05)

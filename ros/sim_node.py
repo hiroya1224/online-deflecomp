@@ -71,7 +71,8 @@ class SimNode:
                  topic_cmd: str, topic_equil: str,
                  imu_frames: Optional[str] = None, imu_topic_base: str = "/imu",
                  integrator: str = "rk4", ref_tau: float = 0.04, ref_max_vel: float = 4.0,
-                 eq_mode: str = "dynamic", tau_eq: float = 0.05) -> None:
+                 eq_mode: str = "dynamic", tau_eq: float = 0.05,
+                 args = None) -> None:
 
         self.dt = float(dt)
         self.topic_cmd = topic_cmd
@@ -85,6 +86,23 @@ class SimNode:
         Ktrue = np.array(kp_true, dtype=float)
         if Ktrue.shape != (self.n,):
             rospy.logwarn("kp_true length mismatches dof; resizing"); Ktrue = np.resize(Ktrue, self.n)
+                # read quasi-static perturbation params (argparse defaults, can be overridden by ROS params)
+        qs_noise_std_deg = rospy.get_param("~qs_noise_std_deg", args.qs_noise_std_deg)
+        qs_vib_amp_deg = rospy.get_param("~qs_vib_amp_deg", args.qs_vib_amp_deg)
+        qs_vib_freq_hz = rospy.get_param("~qs_vib_freq_hz", args.qs_vib_freq_hz)
+        qs_vib_axes_str = rospy.get_param("~qs_vib_axes", args.qs_vib_axes)
+        qs_seed = rospy.get_param("~qs_seed", args.qs_seed)
+        qs_vib_axes_idx = []
+        if isinstance(qs_vib_axes_str, str) and qs_vib_axes_str.strip():
+            try:
+                qs_vib_axes_idx = [int(x) for x in qs_vib_axes_str.split(",") if x.strip()]
+            except Exception:
+                qs_vib_axes_idx = []
+        elif isinstance(qs_vib_axes_str, (list, tuple)):
+            try:
+                qs_vib_axes_idx = [int(x) for x in qs_vib_axes_str]
+            except Exception:
+                qs_vib_axes_idx = []
         params = DynamicParams(
             K=Ktrue, D=None, zeta=float(zeta), q0_for_damp=np.zeros(self.n, dtype=float), use_pinv=True,
             limit_velocity=np.ones(self.n, dtype=float) * float(vel_lim),
@@ -92,6 +110,11 @@ class SimNode:
             limit_position_high=self.robot.model.upperPositionLimit,
             integrator=integrator, ref_tau=ref_tau, ref_max_vel=ref_max_vel,
             eq_mode=eq_mode, tau_eq=tau_eq,   # ← 追加
+            qs_noise_std_deg=float(qs_noise_std_deg),
+            qs_vib_amp_deg=float(qs_vib_amp_deg),
+            qs_vib_freq_hz=float(qs_vib_freq_hz),
+            qs_vib_axes=(np.array(qs_vib_axes_idx, dtype=int) if len(qs_vib_axes_idx)>0 else None),
+            qs_seed=(int(qs_seed) if qs_seed is not None else None),
         )
         self.sim = DynamicSimulator(self.robot, params)
         self.sim.reset(q=np.zeros(self.n), qd=np.zeros(self.n))
@@ -213,6 +236,11 @@ def main() -> None:
     p.add_argument("--integrator", type=str, default="rk4", choices=["rk4","semi_implicit_euler"])
     p.add_argument("--ref-tau", type=float, default=1e-9)
     p.add_argument("--ref-max-vel", type=float, default=1000.0)
+    p.add_argument("--qs-noise-std-deg", type=float, default=0.0)
+    p.add_argument("--qs-vib-amp-deg", type=float, default=0.0)
+    p.add_argument("--qs-vib-freq-hz", type=float, default=50.0)
+    p.add_argument("--qs-vib-axes", type=str, default="")
+    p.add_argument("--qs-seed", type=int, default=None)
     # 既存の argparse 定義の続きに追記
     p.add_argument("--eq-mode", type=str, default="dynamic",
                 choices=["dynamic", "relax_to_eq", "quasistatic"],
@@ -231,6 +259,7 @@ def main() -> None:
         imu_frames=args.imu_frames, imu_topic_base=args.imu_topic_base,
         integrator=args.integrator, ref_tau=args.ref_tau, ref_max_vel=args.ref_max_vel,
         eq_mode=args.eq_mode, tau_eq=args.tau_eq,  # ← 追加
+        args=args
     )
     rospy.spin()
 

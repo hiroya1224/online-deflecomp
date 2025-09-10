@@ -28,7 +28,7 @@ python ros/sim_node.py --urdf /path/to/simple6r.urdf --dt 0.001 --zeta 3.0 --eq-
 
 At terminal 2
 ```
-python ros/estimator_node.py --urdf /home/leus/imufilter_ws/online-deflecomp/simple6r.urdf --frames link6
+python ros/estimator_node.py --urdf /path/to/simple6r.urdf --frames link6
 ```
 
 At terminal 3 (for visualization)

@@ -13,6 +13,7 @@ from std_msgs.msg import Float64MultiArray
 from online_deflecomp.utils.robot import RobotArm
 from online_deflecomp.controller.command import theta_cmd_from_theta_ref, lowpass_theta_cmd
 from online_deflecomp.estimator.ekf import MultiFrameWeirdEKF
+from online_deflecomp.estimator.lag_ekf import LagEKF, LagEKFConfig
 from online_deflecomp.controller.equilibrium import EquilibriumSolver, EquilibriumConfig
 
 import threading
@@ -129,6 +130,21 @@ class EstimatorNode:
         self.wekf = MultiFrameWeirdEKF(x0, P0, Q, eps_def=1e-6)
         self.kp_lim = kp_lim
 
+        # Lag-EKF (first-order lag between theta_cmd and realized u)
+        lag_tau_init = rospy.get_param("~lag_tau_init", 0.2)   # initial tau [s]
+        lag_n_tau   = int(rospy.get_param("~lag_n_tau", 1))    # 1 or n
+        lag_Q_u     = float(rospy.get_param("~lag_Q_u", 1e-5)) # process noise for u
+        lag_Q_p     = float(rospy.get_param("~lag_Q_p", 1e-6)) # process noise for p
+        lag_R_meas  = float(rospy.get_param("~lag_R_meas", 5e-2))  # meas std (rad) per component
+        lag_cfg = LagEKFConfig(
+            n_tau=lag_n_tau,
+            p0=float(np.log(1.0 / max(lag_tau_init, 1e-6))),
+            Q_u=lag_Q_u,
+            Q_p=lag_Q_p,
+            R_meas=lag_R_meas,
+        )
+        self.lag_ekf = LagEKF(self.n, lag_cfg)
+
         # states
         self.q_ref = np.zeros(self.n, dtype=float)
         self.have_ref = False
@@ -139,6 +155,7 @@ class EstimatorNode:
         self.tau_cmd = rospy.get_param("~theta_cmd_tau", 0.2)
 
         # imu buffers
+
         self.imu_bufs: Dict[str, ImuBuffer] = {nm: ImuBuffer(maxlen=2000) for nm in self.frames}
 
         # ROS I/O
@@ -178,20 +195,50 @@ class EstimatorNode:
             return
 
         now = rospy.Time.now().to_sec()
-
-        # (1) 直前の θ_cmd に対する観測で WEKF 更新（IMU を内挿して A_map を作る）
+        # (1) Lag-EKF (analytic) update using IMU at 'now'; then WEKF uses lag-corrected u_hat
         if self.last_cmd is not None and self.last_cmd_t is not None:
-            A_map = self._build_A_map_at(self.last_cmd_t)
+            now = rospy.get_time()
+            dt_cmd = max(0.0, now - self.last_cmd_t)
+            # Predict with input (last_cmd)
+            self.lag_ekf.predict(self.last_cmd, dt_cmd)
+            # Build imu_dirs at current time
+            imu_dirs = {}
+            for nm in self.frames:
+                buf = self.imu_bufs.get(nm, None)
+                if buf is None:
+                    continue
+                g_f = buf.interpolate(now)
+                if g_f is None:
+                    continue
+                imu_dirs[self.frame_ids[nm]] = g_f
+            # Update if we have any measurement
+            if imu_dirs:
+                kp_hat_for_lag = np.exp(self.wekf.x)  # current WEKF Kp estimate
+                theta_init = self.lag_ekf.theta_eq_last if self.lag_ekf.theta_eq_last is not None else self.q_ref
+                self.lag_ekf.update(
+                    imu_dirs=imu_dirs,
+                    frame_ids=list(imu_dirs.keys()),
+                    robot=self.robot,
+                    solver=self.solver,
+                    kp_vec=kp_hat_for_lag,
+                    theta_init=theta_init,
+                )
+            # Now use u_hat for WEKF update
+            u_hat, _ = self.lag_ekf.get_state()
+            A_map = self._build_A_map_at(now)
             if A_map is not None:
                 theta_init = self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else self.q_ref
-                _theta_eq = self.wekf.update_with_multi(self.solver, self.last_cmd, A_map, self.robot, theta_init_eq_pred=theta_init, kp_lim=self.kp_lim)
+                _theta_eq = self.wekf.update_with_multi(
+                    self.solver, u_hat, A_map, self.robot,
+                    theta_init_eq_pred=theta_init, kp_lim=self.kp_lim
+                )
                 # publish Kp
                 kp_hat = np.exp(self.wekf.x)
                 self.pub_kp.publish(Float64MultiArray(data=kp_hat.tolist()))
                 cov_diag = np.clip(np.diag(self.wekf.P), 0.0, np.inf)
                 self.pub_kpc.publish(Float64MultiArray(data=cov_diag.tolist()))
-
-        # (2) 現在の Kp_hat と θ_ref から新しい θ_cmd を生成・publish（次サイクルの基準時刻にもなる）
+    
+    # (2) 現在の Kp_hat と θ_ref から新しい θ_cmd を生成・publish（次サイクルの基準時刻にもなる）
         kp_hat = np.exp(self.wekf.x)
         theta_cmd_raw = theta_cmd_from_theta_ref(self.robot, self.q_ref, kp_hat)
         if self.last_cmd is not None and self.last_cmd_t is not None:

@@ -13,7 +13,7 @@ from std_msgs.msg import Float64MultiArray
 from online_deflecomp.utils.robot import RobotArm
 from online_deflecomp.controller.command import theta_cmd_from_theta_ref, lowpass_theta_cmd
 from online_deflecomp.estimator.ekf import MultiFrameWeirdEKF
-from online_deflecomp.estimator.lag_ekf import LagEKF, LagEKFConfig
+from online_deflecomp.estimator.cmd_lag_ekf import CmdLagEKF, CmdLagEKFConfig
 from online_deflecomp.controller.equilibrium import EquilibriumSolver, EquilibriumConfig
 
 import threading
@@ -26,10 +26,9 @@ class ImuSample:
     t: float          # sec
     g: np.ndarray     # unit 3-vector (gravity direction in that frame)
 
-# ここから既存 ImuBuffer を丸ごと置換
+# Gravity buffer (unit vectors)
 class ImuBuffer:
     def __init__(self, maxlen: int = 1000) -> None:
-        # 時刻とベクトルを並行リストで保持（単調増加でソート）
         self.t_list: List[float] = []
         self.g_list: List[np.ndarray] = []
         self.maxlen = int(maxlen)
@@ -40,16 +39,13 @@ class ImuBuffer:
         n = float(np.linalg.norm(g)) + 1e-12
         g = g / n
         with self.lock:
-            # 昇順位置に挿入（同時刻は後勝ちで上書き）
             idx = bisect_left(self.t_list, t)
             if idx < len(self.t_list) and abs(self.t_list[idx] - t) < 1e-12:
-                # 同一時刻 → 上書き
                 self.t_list[idx] = t
                 self.g_list[idx] = g
             else:
                 self.t_list.insert(idx, t)
                 self.g_list.insert(idx, g)
-            # 先頭から古いものを捨てる
             while len(self.t_list) > self.maxlen:
                 self.t_list.pop(0)
                 self.g_list.pop(0)
@@ -58,13 +54,11 @@ class ImuBuffer:
         with self.lock:
             if not self.t_list:
                 return None
-            # 端でクランプ
             if t <= self.t_list[0]:
                 return self.g_list[0].copy()
             if t >= self.t_list[-1]:
                 return self.g_list[-1].copy()
-            # 2点で線形内挿（成分ごと）→ 正規化
-            idx = bisect_left(self.t_list, t)  # t_list[idx-1] < = t <= t_list[idx]
+            idx = bisect_left(self.t_list, t)
             t0 = self.t_list[idx - 1]; t1 = self.t_list[idx]
             g0 = self.g_list[idx - 1]; g1 = self.g_list[idx]
             if t1 - t0 <= 1e-12:
@@ -73,6 +67,45 @@ class ImuBuffer:
             g = (1.0 - a) * g0 + a * g1
             n = float(np.linalg.norm(g)) + 1e-12
             return g / n
+
+# Gyro buffer (raw angular velocity in frame coords)
+class GyroBuffer:
+    def __init__(self, maxlen: int = 2000) -> None:
+        self.t_list: List[float] = []
+        self.w_list: List[np.ndarray] = []
+        self.maxlen = int(maxlen)
+        self.lock = threading.RLock()
+
+    def push(self, t: float, w: np.ndarray) -> None:
+        w = np.asarray(w, dtype=float).reshape(3,)
+        with self.lock:
+            idx = bisect_left(self.t_list, t)
+            if idx < len(self.t_list) and abs(self.t_list[idx] - t) < 1e-12:
+                self.t_list[idx] = t
+                self.w_list[idx] = w
+            else:
+                self.t_list.insert(idx, t)
+                self.w_list.insert(idx, w)
+            while len(self.t_list) > self.maxlen:
+                self.t_list.pop(0)
+                self.w_list.pop(0)
+
+    def interpolate(self, t: float) -> Optional[np.ndarray]:
+        with self.lock:
+            if not self.t_list:
+                return None
+            if t <= self.t_list[0]:
+                return self.w_list[0].copy()
+            if t >= self.t_list[-1]:
+                return self.w_list[-1].copy()
+            idx = bisect_left(self.t_list, t)
+            t0 = self.t_list[idx - 1]; t1 = self.t_list[idx]
+            w0 = self.w_list[idx - 1]; w1 = self.w_list[idx]
+            if t1 - t0 <= 1e-12:
+                return w1.copy()
+            a = (t - t0) / (t1 - t0)
+            w = (1.0 - a) * w0 + a * w1
+            return w
 
 
 def simple_bingham_unit(before_vec3: np.ndarray, after_vec3: np.ndarray, parameter: float = 100.0) -> np.ndarray:
@@ -130,20 +163,19 @@ class EstimatorNode:
         self.wekf = MultiFrameWeirdEKF(x0, P0, Q, eps_def=1e-6)
         self.kp_lim = kp_lim
 
-        # Lag-EKF (first-order lag between theta_cmd and realized u)
-        lag_tau_init = rospy.get_param("~lag_tau_init", 0.2)   # initial tau [s]
-        lag_n_tau   = int(rospy.get_param("~lag_n_tau", 1))    # 1 or n
-        lag_Q_u     = float(rospy.get_param("~lag_Q_u", 1e-5)) # process noise for u
-        lag_Q_p     = float(rospy.get_param("~lag_Q_p", 1e-6)) # process noise for p
-        lag_R_meas  = float(rospy.get_param("~lag_R_meas", 5e-2))  # meas std (rad) per component
-        lag_cfg = LagEKFConfig(
-            n_tau=lag_n_tau,
-            p0=float(np.log(1.0 / max(lag_tau_init, 1e-6))),
-            Q_u=lag_Q_u,
-            Q_p=lag_Q_p,
-            R_meas=lag_R_meas,
+        # --- delayed-command EKF (y, tau) with gravity+gyro ---
+        lag_cfg = CmdLagEKFConfig(
+            dt=float(dt),
+            qy_diag=float(rospy.get_param("~lag_qy", 1e-4)),
+            qs_diag=float(rospy.get_param("~lag_qs", 1e-9)),
+            rk_diag=float(rospy.get_param("~lag_r", 5e-3)),  # NOTE: param name kept; field renamed
+            tau_init=float(rospy.get_param("~lag_tau_init", 0.0)),
+            tau_min=float(rospy.get_param("~lag_tau_min", 0.0)),
+            tau_max=float(rospy.get_param("~lag_tau_max", 0.8)),
+            ridge=float(rospy.get_param("~lag_ridge", 1e-9)),
+            eps_tau=1e-2,
         )
-        self.lag_ekf = LagEKF(self.n, lag_cfg)
+        self.cmdlag = CmdLagEKF(self.robot, self.frames, self.frame_ids, self.g_unit.reshape(3), lag_cfg)
 
         # states
         self.q_ref = np.zeros(self.n, dtype=float)
@@ -155,8 +187,8 @@ class EstimatorNode:
         self.tau_cmd = rospy.get_param("~theta_cmd_tau", 0.2)
 
         # imu buffers
-
         self.imu_bufs: Dict[str, ImuBuffer] = {nm: ImuBuffer(maxlen=2000) for nm in self.frames}
+        self.gyro_bufs: Dict[str, GyroBuffer] = {nm: GyroBuffer(maxlen=2000) for nm in self.frames}
 
         # ROS I/O
         self.sub_ref = rospy.Subscriber(topic_ref, JointState, self.cb_ref, queue_size=50)
@@ -179,15 +211,23 @@ class EstimatorNode:
         name = (msg.header.frame_id or "").strip()
         if name not in self.imu_bufs:
             return
-        # specific force ≈ a - g  → 静止で -g。重力方向は -lin_acc の単位ベクトルを採用
+        # gravity direction (use -linear_acceleration; static → -g)
         la = np.array([msg.linear_acceleration.x,
                        msg.linear_acceleration.y,
                        msg.linear_acceleration.z], dtype=float)
-        if np.linalg.norm(la) < 1e-9:
-            return
-        g_dir = -la / (np.linalg.norm(la) + 1e-12)
+        if np.linalg.norm(la) >= 1e-9:
+            g_dir = -la / (np.linalg.norm(la) + 1e-12)
+        else:
+            g_dir = None
+        # angular velocity in frame coords
+        w = np.array([msg.angular_velocity.x,
+                      msg.angular_velocity.y,
+                      msg.angular_velocity.z], dtype=float)
         t = msg.header.stamp.to_sec() if msg.header.stamp else rospy.get_time()
-        self.imu_bufs[name].push(t, g_dir)
+        if g_dir is not None:
+            self.imu_bufs[name].push(t, g_dir)
+        if np.all(np.isfinite(w)):
+            self.gyro_bufs[name].push(t, w)
 
     # --- timer loop ---
     def on_timer(self, event) -> None:
@@ -195,50 +235,43 @@ class EstimatorNode:
             return
 
         now = rospy.Time.now().to_sec()
-        # (1) Lag-EKF (analytic) update using IMU at 'now'; then WEKF uses lag-corrected u_hat
-        if self.last_cmd is not None and self.last_cmd_t is not None:
-            now = rospy.get_time()
-            dt_cmd = max(0.0, now - self.last_cmd_t)
-            # Predict with input (last_cmd)
-            self.lag_ekf.predict(self.last_cmd, dt_cmd)
-            # Build imu_dirs at current time
-            imu_dirs = {}
-            for nm in self.frames:
-                buf = self.imu_bufs.get(nm, None)
-                if buf is None:
-                    continue
+
+        # (1) Build gravity and gyro observations at 'now' for cmdlag
+        g_obs: Dict[str, np.ndarray] = {}
+        w_obs: Dict[str, np.ndarray] = {}
+        for nm in self.frames:
+            buf = self.imu_bufs.get(nm, None)
+            if buf is not None:
                 g_f = buf.interpolate(now)
-                if g_f is None:
-                    continue
-                imu_dirs[self.frame_ids[nm]] = g_f
-            # Update if we have any measurement
-            if imu_dirs:
-                kp_hat_for_lag = np.exp(self.wekf.x)  # current WEKF Kp estimate
-                theta_init = self.lag_ekf.theta_eq_last if self.lag_ekf.theta_eq_last is not None else self.q_ref
-                self.lag_ekf.update(
-                    imu_dirs=imu_dirs,
-                    frame_ids=list(imu_dirs.keys()),
-                    robot=self.robot,
-                    solver=self.solver,
-                    kp_vec=kp_hat_for_lag,
-                    theta_init=theta_init,
-                )
-            # Now use u_hat for WEKF update
-            u_hat, _ = self.lag_ekf.get_state()
-            A_map = self._build_A_map_at(now)
-            if A_map is not None:
-                theta_init = self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else self.q_ref
-                _theta_eq = self.wekf.update_with_multi(
-                    self.solver, u_hat, A_map, self.robot,
-                    theta_init_eq_pred=theta_init, kp_lim=self.kp_lim
-                )
-                # publish Kp
-                kp_hat = np.exp(self.wekf.x)
-                self.pub_kp.publish(Float64MultiArray(data=kp_hat.tolist()))
-                cov_diag = np.clip(np.diag(self.wekf.P), 0.0, np.inf)
-                self.pub_kpc.publish(Float64MultiArray(data=cov_diag.tolist()))
-    
-    # (2) 現在の Kp_hat と θ_ref から新しい θ_cmd を生成・publish（次サイクルの基準時刻にもなる）
+                if g_f is not None:
+                    g_obs[nm] = g_f
+            gbuf = self.gyro_bufs.get(nm, None)
+            if gbuf is not None:
+                w_f = gbuf.interpolate(now)
+                if w_f is not None:
+                    w_obs[nm] = w_f
+
+        # (2) delayed-command EKF step (inputs: current intended command as excitation)
+        kp_hat_tmp = np.exp(self.wekf.x)
+        u_k_for_lag = theta_cmd_from_theta_ref(self.robot, self.q_ref, kp_hat_tmp)
+        y_for_ekf, tau_vec = self.cmdlag.update(u_k=u_k_for_lag, g_obs=g_obs, omega_obs=w_obs if w_obs else None)
+
+        print(tau_vec)
+        # (3) WEKF update with gravity A_map aligned at 'now' and lag-consistent theta_cmd
+        A_map = self._build_A_map_at(now)
+        if A_map is not None:
+            theta_init = self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else self.q_ref
+            _theta_eq = self.wekf.update_with_multi(
+                self.solver, y_for_ekf, A_map, self.robot,
+                theta_init_eq_pred=theta_init, kp_lim=self.kp_lim
+            )
+            # publish Kp
+            kp_hat = np.exp(self.wekf.x)
+            self.pub_kp.publish(Float64MultiArray(data=kp_hat.tolist()))
+            cov_diag = np.clip(np.diag(self.wekf.P), 0.0, np.inf)
+            self.pub_kpc.publish(Float64MultiArray(data=cov_diag.tolist()))
+
+        # (4) 新しい θ_cmd を生成・publish（出力経路は従来どおり）
         kp_hat = np.exp(self.wekf.x)
         theta_cmd_raw = theta_cmd_from_theta_ref(self.robot, self.q_ref, kp_hat)
         if self.last_cmd is not None and self.last_cmd_t is not None:

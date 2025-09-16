@@ -51,6 +51,9 @@ class CmdLagEKFConfig:
     use_omega_ema: bool = True
     omega_alpha: float = 0.2  # in (0,1]; 1.0 = no smoothing
 
+    # spring sensitivity floor for cos((theta - u)/2)
+    spring_cos_floor: float = 1e-6
+
 
 class CmdLagEKF:
     """
@@ -203,17 +206,22 @@ class CmdLagEKF:
         except Exception:
             theta_eq = self.last_theta_eq.copy() if (self.last_theta_eq is not None) else y_pred.copy()
 
-        # 3) build S = H^{-1} Kp at theta_eq
+        # 3) build S = H^{-1} K_eff at theta_eq (NONLINEAR spring)
         try:
             Htheta = self.robot.d_tau_gravity(theta_eq).astype(float)
         except Exception:
             Htheta = np.zeros((self.n, self.n), dtype=float)
-        H = Htheta + np.diag(kp_vec)
+        # effective spring slope: K_eff = Kp * cos((theta_eq - y_pred)/2)
+        d_nl = (theta_eq - y_pred)  # no wrap to keep S^1 continuity
+        c_half = np.cos(0.5 * d_nl)
+        c_eff = np.clip(c_half, float(self.cfg.spring_cos_floor), 1.0)
+        K_eff = kp_vec * c_eff
+        H = Htheta + np.diag(K_eff)
         try:
             Hinv = np.linalg.pinv(H, rcond=1e-10)
         except Exception:
             Hinv = np.linalg.pinv(H + 1e-6 * np.eye(self.n))
-        S = Hinv @ np.diag(kp_vec)
+        S = Hinv @ np.diag(K_eff)
 
         # 4) Phi = W_local(theta_eq) * S * Diag(e)
         W = self._stack_W_local(theta_eq)

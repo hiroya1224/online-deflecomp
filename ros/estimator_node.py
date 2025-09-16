@@ -4,17 +4,18 @@
 This node estimates Kp (via EKF with Bingham gravity residuals) and plant lag kappa (via gyro-only RLS),
 then publishes a stabilized theta_cmd. It also prints numeric-only debug lines (IDs 1..7) for analysis.
 
-Command-line options include per-feature toggles for the RLS stabilizers:
-  forgetting / normalization / innovation-clip / gating / projection, and gyro EMA.
+With "equi-damped (double-pole)" publish LPF:
+  - Plant pole: a = exp(-dt/tau)
+  - Publish LPF pole: a_p = exp(-dt/tau_pub)
+  - Desired closed-loop double pole: beta_eff = sqrt(a * a_p)
+  - Gain: L = diag(gamma) * S^{-1},  gamma = (a + a_p - 2*sqrt(a a_p)) / ((1 - a)*(1 - a_p))
 
 Debug CSV line formats (first field is line-type ID):
 1,k,t,dt_ms,ms_cmdlag,ms_wekf,ms_eq,ms_total,n_g,n_w,had_A_map,wekf_updated,eq_solved
 2,k,condH,condS,normSinv,lfac_min,lfac_max,denom_min,beta_min,beta_max,a_min,a_max
-3,k,norm_theta_err,norm_du_raw,norm_du_lim,rate_hit,sat_min_hit,sat_max_hit
-4,k,theta_ref...,theta_eq...,u_cmd...
-5,k,a_vec...,beta_speed...,beta_vec...,lfac...
-6,k,y_hat...,tau_vec...
-7,k,u_star...
+  * here lfac_min/max := min/max(gamma), beta_* := min/max(beta_eff), denom_min := min_j ((1-a_j)*(1-a_pj))
+5,k,a_vec...,a_pub_vec...,beta_eff_vec...,gamma_vec...
+(others unchanged)
 """
 import argparse
 from bisect import bisect_left
@@ -33,8 +34,18 @@ from online_deflecomp.controller.command import theta_cmd_from_theta_ref
 from online_deflecomp.controller.equilibrium import EquilibriumSolver, EquilibriumConfig
 from online_deflecomp.estimator.ekf import MultiFrameWeirdEKF
 from online_deflecomp.estimator.cmd_lag_ekf import CmdLagEKF, CmdLagEKFConfig
-
+ 
 # ---------------- helpers ----------------
+def angle_wrap(x: np.ndarray) -> np.ndarray:
+    # elementwise wrap to (-pi, pi]
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
+
+def angle_unwrap_to_ref(cur: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    # return cur' s.t. (cur' - ref) is the minimal (wrapped) difference
+    d = angle_wrap(cur - ref)
+    return ref + d
+
+
 def map_jointstate_to_model(msg: JointState, model_names: List[str]) -> np.ndarray:
     name_to_idx = {n: i for i, n in enumerate(msg.name)}
     q = np.zeros(len(model_names), dtype=float)
@@ -217,7 +228,7 @@ class EstimatorNode:
         # State
         self.q_ref = np.zeros(self.n, dtype=float)
         self.have_ref = False
-        self.last_cmd: Optional[np.ndarray] = None
+        self.last_cmd: Optional[np.ndarray] = None  # published (LPF'ed) command
         self.last_cmd_t: Optional[float] = None
 
         # IMU buffers
@@ -318,7 +329,6 @@ class EstimatorNode:
         )
         t_cmdlag1 = time.perf_counter()
         self.pub_tau.publish(Float64MultiArray(data=tau_vec.tolist()))
-        self.pub_tpub.publish(Float64MultiArray(data=self.cmdlag.get_tau_pub().tolist()))
 
         # (3) Build A_map from IMU gravity observations (for Bingham WEKF)
         A_map: Dict[int, np.ndarray] = {}
@@ -355,50 +365,64 @@ class EstimatorNode:
         self.pub_kp.publish(Float64MultiArray(data=self.kp_hat_smooth.tolist()))
         self.pub_kpc.publish(Float64MultiArray(data=np.diag(self.wekf.P).tolist()))
 
-        # (6) compute S and control gain L (certainty equivalence)
+        # (6) compute NONLINEAR S and equi-damped gain L = diag(gamma) * S^{-1}
         t_eq0 = time.perf_counter()
         try:
             Htheta = self.robot.d_tau_gravity(theta_eq).astype(float)
         except Exception:
             Htheta = np.zeros((self.n, self.n), dtype=float)
-        H = Htheta + np.diag(self.kp_hat_smooth)
+        # K_eff = Kp * cos((theta_eq - y_hat)/2), with floor for numerical stability
+        d_nl = (theta_eq - y_hat)  # no wrap (S^1-consistent via cos)
+        c_half = np.cos(0.5 * d_nl)
+        c_eff = np.clip(c_half, 1e-3, 1.0)
+        K_eff = self.kp_hat_smooth * c_eff
+        H = Htheta + np.diag(K_eff)
         try:
             Hinv = np.linalg.pinv(H, rcond=1e-10)
         except Exception:
             Hinv = np.linalg.pinv(H + 1e-6 * np.eye(self.n))
-        S = Hinv @ np.diag(self.kp_hat_smooth)
+        S = Hinv @ np.diag(K_eff)
 
+        # plant pole a
         a_vec = np.exp(-self.dt / np.maximum(tau_vec, 1e-6))
-        beta_speed = np.exp(-self.dt / np.maximum(self.fb_tau_des, 1e-6))
-        beta_vec = beta_speed.copy()  # (ここでノイズ上限制約等を入れる場合は、この行で調整)
-        denom = np.maximum(1.0 - a_vec, self.inv_denom_min)
-        lfac = (a_vec - beta_vec) / denom
+        # desired speed -> beta_des
+        beta_des = np.exp(-self.dt / np.maximum(self.fb_tau_des, 1e-6))
+        # publish LPF pole a_p solved from beta_des^2 = a * a_p
+        a_pub_vec = beta_des * beta_des / np.maximum(a_vec, 1e-12)
+        a_pub_vec = np.clip(a_pub_vec, 1e-6, 1.0 - 1e-6)
+
+        # equi-damped gamma
+        sqrt_aa = np.sqrt(a_vec * a_pub_vec)
+        denom_prod = np.maximum((1.0 - a_vec) * (1.0 - a_pub_vec), self.inv_denom_min)
+        gamma_vec = (a_vec + a_pub_vec - 2.0 * sqrt_aa) / denom_prod
 
         try:
             Sinv = np.linalg.pinv(S, rcond=1e-10)
         except Exception:
             Sinv = np.linalg.pinv(S + 1e-6 * np.eye(self.n))
-        L = (np.diag(lfac) @ Sinv)
+        L = (np.diag(gamma_vec) @ Sinv)
         t_eq1 = time.perf_counter()
 
-        # (7) compute u* and feedback
+        # (7) u* and raw FB
         u_star = theta_cmd_from_theta_ref(self.robot, self.q_ref, self.kp_hat_smooth)
-        theta_err = (theta_eq - self.q_ref)
+        # use shortest-arc error on S1 to avoid 2*pi jumps near +/-pi
+        theta_err = angle_wrap(theta_eq - self.q_ref)
         u_cmd_raw = u_star - (L @ theta_err)
 
-        # (8) safety: rate limit
-        rate_hit = 0
+        # (8) publish LPF: u_k = a_p * u_{k-1} + (1-a_p) * u_raw, then rate limit
         if self.last_cmd is not None:
-            du = u_cmd_raw - self.last_cmd
-            max_step = self.rate_limit * self.dt
-            du_lim = np.clip(du, -max_step, max_step)
-            if np.any(np.abs(du) > max_step + 1e-12):
-                rate_hit = 1
-            u_cmd = self.last_cmd + du_lim
+            # unwrap raw command to be continuous w.r.t. last published value
+            u_cmd_raw = angle_unwrap_to_ref(u_cmd_raw, self.last_cmd)
+            u_lpf = a_pub_vec * self.last_cmd + (1.0 - a_pub_vec) * u_cmd_raw
+            du = u_lpf - self.last_cmd
         else:
-            du = u_cmd_raw.copy()
-            du_lim = du.copy()
-            u_cmd = u_cmd_raw.copy()
+            u_lpf = u_cmd_raw.copy()
+            du = u_lpf.copy()
+
+        max_step = self.rate_limit * self.dt
+        du_lim = np.clip(du, -max_step, max_step)
+        rate_hit = 1 if np.any(np.abs(du) > max_step + 1e-12) else 0
+        u_cmd = (self.last_cmd + du_lim) if (self.last_cmd is not None) else u_lpf.copy()
 
         # (9) publish
         out = JointState()
@@ -407,7 +431,10 @@ class EstimatorNode:
         out.position = u_cmd.tolist()
         self.pub_cmd.publish(out)
 
-        # (10) book-keeping
+        # (10) telemetry
+        self.pub_tpub.publish(Float64MultiArray(data=(-self.dt / np.log(np.maximum(a_pub_vec, 1e-12))).tolist()))
+
+        # (11) book-keeping
         self.last_cmd = u_cmd.copy()
         self.last_cmd_t = now
 
@@ -431,12 +458,14 @@ class EstimatorNode:
                 normSinv = float(np.linalg.norm(Sinv, 2))
             except Exception:
                 normSinv = float(np.linalg.norm(Sinv))
-            lfac_min = float(np.min(lfac)); lfac_max = float(np.max(lfac))
-            denom_min = float(np.min(denom))
-            beta_min = float(np.min(beta_vec)); beta_max = float(np.max(beta_vec))
+            # for ID=2: reuse fields with new semantics (see header)
+            beta_eff_vec = np.sqrt(a_vec * a_pub_vec)
+            beta_min = float(np.min(beta_eff_vec)); beta_max = float(np.max(beta_eff_vec))
+            lfac_min = float(np.min(gamma_vec)); lfac_max = float(np.max(gamma_vec))
             a_min = float(np.min(a_vec)); a_max = float(np.max(a_vec))
-            norm_theta_err = float(np.linalg.norm(theta_err))
-            norm_du_raw = float(np.linalg.norm(du))
+            denom_min = float(np.min(denom_prod))
+            norm_theta_err = float(np.linalg.norm(theta_err))  # already wrapped
+            norm_du_raw = float(np.linalg.norm(u_cmd_raw - (self.last_cmd if self.last_cmd is not None else 0.0)))
             norm_du_lim = float(np.linalg.norm(du_lim))
 
             # 1: summary
@@ -445,7 +474,7 @@ class EstimatorNode:
                 f"{ms_cmdlag:.3f}", f"{ms_wekf:.3f}", f"{ms_eq:.3f}", f"{ms_total:.3f}",
                 n_g, n_w, 1 if had_A_map else 0, 1 if wekf_updated else 0, 1
             ]))
-            # 2: gains/conds
+            # 2: conds/gamma/beta
             print(",".join(str(x) for x in [
                 2, k,
                 f"{condH:.6e}", f"{condS:.6e}", f"{normSinv:.6e}",
@@ -459,10 +488,10 @@ class EstimatorNode:
                 f"{norm_theta_err:.6e}", f"{norm_du_raw:.6e}", f"{norm_du_lim:.6e}",
                 rate_hit, 0, 0
             ]))
-            # 4: vectors
+            # 4: vectors (theta_ref, theta_eq, u_cmd)
             print(",".join([str(4), str(k)] + [f"{v:.6e}" for v in self.q_ref.tolist() + theta_eq.tolist() + u_cmd.tolist()]))
-            # 5: a/beta/lfac vectors
-            print(",".join([str(5), str(k)] + [f"{v:.6e}" for v in a_vec.tolist() + beta_speed.tolist() + beta_vec.tolist() + lfac.tolist()]))
+            # 5: a/beta/gamma vectors -> (a_vec, a_pub_vec, beta_eff_vec, gamma_vec)
+            print(",".join([str(5), str(k)] + [f"{v:.6e}" for v in a_vec.tolist() + a_pub_vec.tolist() + beta_eff_vec.tolist() + gamma_vec.tolist()]))
             # 6: y_hat and tau_vec
             print(",".join([str(6), str(k)] + [f"{v:.6e}" for v in y_hat.tolist() + tau_vec.tolist()]))
             # 7: u_star
@@ -484,15 +513,15 @@ def main() -> None:
 
     # control layer
     ap.add_argument("--kp-smooth-alpha", type=float, default=0.2)
-    ap.add_argument("--fb-tau-des", type=str, default="0.08")
+    ap.add_argument("--fb-tau-des", type=str, default="0.08")  # desired closed-loop speed (used to solve a_p)
     ap.add_argument("--inv-denom-min", type=float, default=1e-3)
     ap.add_argument("--rate-limit", type=float, default=2.0)
 
     # debug
     ap.add_argument("--dbg-interval", type=int, default=1)
 
-    # --- RLS feature toggles (cmd_lag_ekf) ---
-    ap.add_argument("--rls-lambda", type=float, default=0.99)
+    # --- RLS feature toggles (cmd_lag_ekf) --- (defaults updated per request)
+    ap.add_argument("--rls-lambda", type=float, default=0.9)
     ap.add_argument("--rls-use-forgetting", action="store_true", default=True)
     ap.add_argument("--rls-no-forgetting", dest="rls_use_forgetting", action="store_false")
 

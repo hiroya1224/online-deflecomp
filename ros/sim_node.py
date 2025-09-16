@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import argparse, os, sys
+import argparse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import rospy
 from sensor_msgs.msg import JointState, Imu
 
-# local lib (no catkin dependency)
+# local lib
 from online_deflecomp.simulation.dynamic_simulator import DynamicSimulator, DynamicParams  # noqa: E402
 from online_deflecomp.utils.robot import RobotArm
 
-# ---- helpers (rpy/quat/imu parse) は前回提示のものと同じ ----
+# ---------- angle helpers ----------
+def angle_wrap(x: np.ndarray) -> np.ndarray:
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
+
+def angle_unwrap_to_ref(cur: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    d = angle_wrap(cur - ref)
+    return ref + d
+
+# ---- helpers (rpy/quat/imu parse) ----
 @dataclass
 class ImuOffset:
     R_li: np.ndarray
@@ -86,13 +94,14 @@ class SimNode:
         Ktrue = np.array(kp_true, dtype=float)
         if Ktrue.shape != (self.n,):
             rospy.logwarn("kp_true length mismatches dof; resizing"); Ktrue = np.resize(Ktrue, self.n)
-                # read quasi-static perturbation params (argparse defaults, can be overridden by ROS params)
+
+        # quasi-static perturbation params (argparse defaults, overridable via ROS params)
         qs_noise_std_deg = rospy.get_param("~qs_noise_std_deg", args.qs_noise_std_deg)
-        qs_vib_amp_deg = rospy.get_param("~qs_vib_amp_deg", args.qs_vib_amp_deg)
-        qs_vib_freq_hz = rospy.get_param("~qs_vib_freq_hz", args.qs_vib_freq_hz)
-        qs_vib_axes_str = rospy.get_param("~qs_vib_axes", args.qs_vib_axes)
-        qs_seed = rospy.get_param("~qs_seed", args.qs_seed)
-        qs_vib_axes_idx = []
+        qs_vib_amp_deg  = rospy.get_param("~qs_vib_amp_deg",  args.qs_vib_amp_deg)
+        qs_vib_freq_hz  = rospy.get_param("~qs_vib_freq_hz",  args.qs_vib_freq_hz)
+        qs_vib_axes_str = rospy.get_param("~qs_vib_axes",     args.qs_vib_axes)
+        qs_seed         = rospy.get_param("~qs_seed",         args.qs_seed)
+        qs_vib_axes_idx: List[int] = []
         if isinstance(qs_vib_axes_str, str) and qs_vib_axes_str.strip():
             try:
                 qs_vib_axes_idx = [int(x) for x in qs_vib_axes_str.split(",") if x.strip()]
@@ -103,13 +112,14 @@ class SimNode:
                 qs_vib_axes_idx = [int(x) for x in qs_vib_axes_str]
             except Exception:
                 qs_vib_axes_idx = []
+
         params = DynamicParams(
             K=Ktrue, D=None, zeta=float(zeta), q0_for_damp=np.zeros(self.n, dtype=float), use_pinv=True,
             limit_velocity=np.ones(self.n, dtype=float) * float(vel_lim),
             limit_position_low=self.robot.model.lowerPositionLimit,
             limit_position_high=self.robot.model.upperPositionLimit,
             integrator=integrator, ref_tau=ref_tau, ref_max_vel=ref_max_vel,
-            eq_mode=eq_mode, tau_eq=tau_eq,   # ← 追加
+            eq_mode=eq_mode, tau_eq=tau_eq,
             qs_noise_std_deg=float(qs_noise_std_deg),
             qs_vib_amp_deg=float(qs_vib_amp_deg),
             qs_vib_freq_hz=float(qs_vib_freq_hz),
@@ -119,7 +129,7 @@ class SimNode:
         self.sim = DynamicSimulator(self.robot, params)
         self.sim.reset(q=np.zeros(self.n), qd=np.zeros(self.n))
 
-        # θcmd buffer（線形補間）
+        # theta_cmd buffer（angle-aware interpolation）
         self.cmd_t_prev: Optional[float] = None
         self.cmd_q_prev: Optional[np.ndarray] = None
         self.cmd_t_last: Optional[float] = None
@@ -130,7 +140,7 @@ class SimNode:
         self.pub_equil = rospy.Publisher(self.topic_equil, JointState, queue_size=10)
         self.sub_cmd = rospy.Subscriber(self.topic_cmd, JointState, self.cb_cmd, queue_size=50)
 
-        # IMU publishers
+        # IMU publishers (single topic, different frame_id)
         self.imu_offsets: Dict[str, ImuOffset] = {}
         self.imu_fids: Dict[str, int] = {}
         self.imu_pubs: Dict[str, rospy.Publisher] = {}
@@ -140,13 +150,13 @@ class SimNode:
                 self.imu_offsets[lname] = off
                 self.imu_fids[lname] = fid
                 topic = f"{self.imu_topic_base}"
-                self.imu_pubs[lname] = rospy.Publisher(topic, Imu, queue_size=20)
+                self.imu_pubs[lname] = rospy.Publisher(topic, Imu, queue_size=50)
                 rospy.loginfo("IMU publisher: frame=%s -> %s", lname, topic)
 
         self.ready = True
         self.timer = rospy.Timer(rospy.Duration.from_sec(self.dt), self.on_timer)
 
-    # --- θcmd callback ---
+    # --- theta_cmd callback ---
     def cb_cmd(self, msg: JointState) -> None:
         name_to_idx = {n: i for i, n in enumerate(msg.name)}
         q = np.zeros(self.n, dtype=float)
@@ -156,6 +166,11 @@ class SimNode:
             if j is not None and j < len(pos):
                 q[i] = float(pos[j])
         t = msg.header.stamp.to_sec() if msg.header.stamp else rospy.get_time()
+
+        # angle-unwrapped continuity vs last command
+        if self.cmd_q_last is not None:
+            q = angle_unwrap_to_ref(q, self.cmd_q_last)
+
         if self.cmd_t_last is not None:
             self.cmd_t_prev, self.cmd_q_prev = self.cmd_t_last, self.cmd_q_last
         self.cmd_t_last, self.cmd_q_last = t, q
@@ -166,11 +181,14 @@ class SimNode:
             return np.zeros(self.n, dtype=float)
         if self.cmd_t_prev is None or self.cmd_t_last <= self.cmd_t_prev + 1e-9:
             return self.cmd_q_last.copy()
+        # interpolate on the unwrapped arc to avoid 2*pi jumps
+        q0 = self.cmd_q_prev
+        q1 = angle_unwrap_to_ref(self.cmd_q_last, q0)
         a = (t_now - self.cmd_t_prev) / (self.cmd_t_last - self.cmd_t_prev)
-        a = np.clip(a, 0.0, 1.0)
-        return (1.0 - a) * self.cmd_q_prev + a * self.cmd_q_last
+        a = float(np.clip(a, 0.0, 1.0))
+        return (1.0 - a) * q0 + a * q1
 
-    # --- IMU generation（前回提示と同じ） ---
+    # --- IMU generation ---
     def publish_imus(self, q: np.ndarray, qd: np.ndarray, qdd: np.ndarray, now: rospy.Time) -> None:
         import pinocchio as pin
         pin.forwardKinematics(self.robot.model, self.robot.data, q, qd, qdd)
@@ -210,16 +228,17 @@ class SimNode:
         if not self.ready or not self.have_cmd:
             return
         theta_cmd = self._interp_cmd(rospy.get_time())
-        # plant: q_ref = theta_cmd（バネの無負荷角）
         q_prev, qd_prev = self.sim.state()
         q_next, qd_next = self.sim.step(dt=self.dt, q_ref=theta_cmd, tau_ext=None)
         qdd_est = (qd_next - qd_prev) / max(self.dt, 1e-9)
         now = rospy.Time.now()
-        # publish equilibrium (plant state)
+
+        # publish equilibrium proxy (current q)
         js = JointState(); js.header.stamp = now; js.name = self.joint_names
         js.position = [float(x) for x in q_next.tolist()]
         self.pub_equil.publish(js)
-        # imu
+
+        # IMUs
         self.publish_imus(q_next, qd_next, qdd_est, now)
 
 def main() -> None:
@@ -229,24 +248,27 @@ def main() -> None:
     p.add_argument("--kp-true", type=str, default="60,60,40,40,20,20")
     p.add_argument("--zeta", type=float, default=0.9)
     p.add_argument("--vel", type=float, default=10.0)
-    p.add_argument("--topic-cmd", type=str, default="/cmd/joint_states")      # subscribe
-    p.add_argument("--topic-equil", type=str, default="/equil/joint_states")  # publish
+    p.add_argument("--topic-cmd", type=str, default="/cmd/joint_states")
+    p.add_argument("--topic-equil", type=str, default="/equil/joint_states")
     p.add_argument("--imu-frames", type=str, default="link2;link3;link6")
     p.add_argument("--imu-topic-base", type=str, default="/imu")
     p.add_argument("--integrator", type=str, default="rk4", choices=["rk4","semi_implicit_euler"])
-    p.add_argument("--ref-tau", type=float, default=1e-9)
-    p.add_argument("--ref-max-vel", type=float, default=1000.0)
+    p.add_argument("--ref-tau", type=float, default=1e-3)
+    p.add_argument("--ref-max-vel", type=float, default=10.0)
+
+    # quasi-static perturbations
     p.add_argument("--qs-noise-std-deg", type=float, default=0.0)
     p.add_argument("--qs-vib-amp-deg", type=float, default=0.0)
     p.add_argument("--qs-vib-freq-hz", type=float, default=50.0)
     p.add_argument("--qs-vib-axes", type=str, default="")
     p.add_argument("--qs-seed", type=int, default=None)
-    # 既存の argparse 定義の続きに追記
+
+    # equilibrium tracking modes
     p.add_argument("--eq-mode", type=str, default="dynamic",
-                choices=["dynamic", "relax_to_eq", "quasistatic"],
-                help="equilibrium tracking mode")
+                   choices=["dynamic", "relax_to_eq", "quasistatic"],
+                   help="equilibrium tracking mode")
     p.add_argument("--tau-eq", type=float, default=0.05,
-                help="time constant [s] for relax_to_eq")
+                   help="time constant [s] for relax_to_eq")
 
     args = p.parse_args()
 
@@ -258,8 +280,7 @@ def main() -> None:
         topic_cmd=args.topic_cmd, topic_equil=args.topic_equil,
         imu_frames=args.imu_frames, imu_topic_base=args.imu_topic_base,
         integrator=args.integrator, ref_tau=args.ref_tau, ref_max_vel=args.ref_max_vel,
-        eq_mode=args.eq_mode, tau_eq=args.tau_eq,  # ← 追加
-        args=args
+        eq_mode=args.eq_mode, tau_eq=args.tau_eq, args=args
     )
     rospy.spin()
 

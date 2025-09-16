@@ -1,262 +1,299 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import numpy as np
 
-import pinocchio as pin  # LOCAL frame Jacobian (matches sim IMU local)
+from online_deflecomp.utils.robot import RobotArm
+from online_deflecomp.controller.equilibrium import EquilibriumSolver
 
-# Model (per joint):
-#   First-order lag: ydot = kappa * (u - y),  kappa = 1 / tau.
-#   BE propagation:  y_k = (y_{k-1} + dt * (kappa ∘ u_k)) / (1 + dt * kappa).
-#   Gyro-only regress: Omega ≈ W_local(y) * Diag(e) * kappa,  e = u - y.
-#
-# "Safe poles" for public LPF (per joint):
-#   a = exp(-dt / tau_hat),  choose alpha_pub = 1 - a  (double pole at z=a).
-#   tau_pub = dt * a / (1 - a).
-#
+# ----------------------------
+# Config with per-feature toggles
+# ----------------------------
 @dataclass
 class CmdLagEKFConfig:
+    # timing
     dt: float
-    # RLS hyper-parameters
+
+    # tau bounds/init (per-joint)
+    tau_init: float = 0.20
+    tau_min: float = 0.00
+    tau_max: float = 0.80
+    eps_tau: float = 1e-2
+
+    # RLS hyper-params
     rls_lambda: float = 0.99
     rls_P0: float = 1e2
     rls_ridge: float = 1e-9
-    # placeholders / numeric guards (as requested)
+
+    # numeric guards
     qy_diag: float = 1e-6
     qs_diag: float = 1e-6
     rk_diag: float = 1e-6
     ridge: float = 1e-6
-    # tau bounds/init
-    tau_init: float = 0.0
-    tau_min: float = 0.0
-    tau_max: float = 0.8
-    eps_tau: float = 1e-2
-    # gating
-    phi_norm_min: float = 1e-8   # skip update if ||Phi||_F is too small
-    e_min: float = 1e-6          # floor for e = u - y
-    # public LPF tau bounds
+    phi_norm_min: float = 1e-8
+    e_min: float = 1e-6
+
+    # tau_pub bounds (for public LPF suggestion)
     tau_pub_min: float = 1e-5
     tau_pub_max: float = 10.0
-    # robustness for noisy gyro
-    omega_alpha: float = 0.2   # EMA factor for Omega, in (0,1]; 1.0 = no smoothing
-    innov_clip: float = 5.0    # clip magnitude for innovation (rad/s units)
+
+    # --- feature toggles (RLS stability tricks) ---
+    use_forgetting: bool = True         # forgetting factor lambda
+    use_normalize: bool = True          # normalize Phi and Omega
+    norm_epsilon: float = 1e-12         # epsilon for normalization
+    use_innov_clip: bool = True         # clip innovation
+    innov_clip: float = 5.0             # |innovation| limit (rad/s)
+    use_gating: bool = True             # gate update when Phi/e too small
+    use_projection: bool = True         # project kappa to [1/tau_max, 1/tau_min]
+
+    # gyro smoothing
+    use_omega_ema: bool = True
+    omega_alpha: float = 0.2  # in (0,1]; 1.0 = no smoothing
+
 
 class CmdLagEKF:
-    def __init__(self, robot, frames: List[str], frame_ids: Dict[str, int], g_unit: np.ndarray, cfg: CmdLagEKFConfig) -> None:
+    """
+    Gyro-only vector RLS for kappa (1/tau) with optional stability tricks.
+    Builds Phi = W_local(theta_eq) @ S @ Diag(e), with e = u - y.
+    """
+    def __init__(self,
+                 robot: RobotArm,
+                 frames: List[str],
+                 frame_ids: Dict[str, int],
+                 g_unit: np.ndarray,
+                 cfg: CmdLagEKFConfig) -> None:
         self.robot = robot
         self.frames = list(frames)
         self.frame_ids = dict(frame_ids)
-        self.g_unit = np.asarray(g_unit, dtype=float).reshape(3)
+        self.g_unit = np.asarray(g_unit, dtype=float)
         self.cfg = cfg
 
-        self.n = robot.nv
-        self.m = 3 * len(self.frames)  # stacked angular velocity (3 per frame)
-        # state: [y(n), log(tau)(n)]
-        self.x = np.zeros(2 * self.n, dtype=float)
-        # parameter covariance for kappa (n x n)
-        self.Pt = np.eye(self.n, dtype=float) * float(cfg.rls_P0)
+        self.n = self.robot.nv
+        self.m = 3 * len(self.frames)  # 3 per frame (local angular velocity)
 
-        # bounds for kappa from tau bounds
-        tau_lo = max(float(cfg.eps_tau), float(cfg.tau_min))
-        tau_hi = float(cfg.tau_max) if float(cfg.tau_max) > 0.0 else np.inf
-        self.kappa_min = 0.0 if np.isinf(tau_hi) else 1.0 / max(tau_hi, cfg.eps_tau)
-        self.kappa_max = 1.0 / tau_lo
+        # RLS state: kappa (diag) and covariance Pt
+        kappa0 = np.full((self.n,), 1.0 / max(self.cfg.tau_init, 1e-9), dtype=float)
+        self.kappa = kappa0.copy()
+        self.Pt = np.eye(self.n, dtype=float) * float(self.cfg.rls_P0)
 
-        # parameters: kappa only
-        tau0 = max(float(cfg.eps_tau), float(cfg.tau_init))
-        k0 = np.clip(1.0 / tau0, self.kappa_min, self.kappa_max)
-        self.kappa = np.full((self.n,), float(k0), dtype=float)
+        # plant-side lag state y
+        self.y_prev = np.zeros((self.n,), dtype=float)
 
-        # RLS covariance over kappa (n x n)
-        self.Pt = np.eye(self.n, dtype=float) * float(cfg.rls_P0)
+        # public tau suggestion (for telemetry)
+        self.tau_pub_vec = np.full((self.n,), float(self.cfg.tau_pub_min), dtype=float)
 
-        # previous command (kept for completeness)
-        self.u_prev = np.zeros(self.n, dtype=float)
+        # EMA for stacked Omega
+        self.omega_ema = np.zeros((self.m,), dtype=float)
 
-        # expose s = log(tau)
-        tau_vec = 1.0 / np.maximum(self.kappa, 1e-12)
-        self.x[self.n:] = np.log(np.maximum(cfg.eps_tau, tau_vec))
-
-        # per-joint recommended public LPF tau (computed each step)
-        self.tau_pub_vec = np.full((self.n,), float(cfg.tau_pub_min), dtype=float)
-
+        # book-keeping
         self.initialized = False
-        self.theta_eq_last: Optional[np.ndarray] = None
-        # EMA of stacked Omega
-        self.omega_ema = np.zeros(self.m, dtype=float)
+        self.last_theta_eq: Optional[np.ndarray] = None
 
-    # ---------- Pinocchio helpers (LOCAL IMU frame) ----------
-    def _fk_update(self, q: np.ndarray) -> None:
-        pin.computeJointJacobians(self.robot.model, self.robot.data, q)
-        pin.updateFramePlacements(self.robot.model, self.robot.data)
-
-    def _W_local_stack(self, q: np.ndarray) -> np.ndarray:
-        # Stack LOCAL angular Jacobians (3 x n) for each frame
-        self._fk_update(q)
-        blocks = []
-        for nm in self.frames:
-            fid = self.frame_ids.get(nm, None)
-            if fid is None:
-                blocks.append(np.zeros((3, self.n), dtype=float))
-                continue
-            J6 = pin.computeFrameJacobian(self.robot.model, self.robot.data, q, fid, pin.ReferenceFrame.LOCAL)
-            blocks.append(J6[3:6, :])
-        return np.vstack(blocks) if blocks else np.zeros((0, self.n), dtype=float)
-
-    # ---------- lag propagation ----------
-    @staticmethod
-    def _be_step(y_prev: np.ndarray, u: np.ndarray, kappa: np.ndarray, dt: float) -> np.ndarray:
-        denom = 1.0 + dt * kappa
-        return (y_prev + dt * (kappa * u)) / denom
-
-    def reset(self, y0: Optional[np.ndarray] = None) -> None:
-        y = np.zeros(self.n, dtype=float) if y0 is None else np.asarray(y0, dtype=float).reshape(self.n)
-        self.x[:self.n] = y
-        self.initialized = True
-
-    def _update_tau_pub_from_tau(self, tau: np.ndarray) -> None:
+    # ---------- helpers ----------
+    def _propagate_y_BE(self, u: np.ndarray, kappa: np.ndarray) -> np.ndarray:
         dt = float(self.cfg.dt)
-        a = np.exp(-dt / tau)
-        one_minus_a = np.maximum(1.0 - a, 1e-9)
-        tau_pub = dt * a / one_minus_a
-        tau_pub = np.clip(tau_pub, float(self.cfg.tau_pub_min), float(self.cfg.tau_pub_max))
-        self.tau_pub_vec = tau_pub
+        num = self.y_prev + dt * (kappa * u)
+        den = 1.0 + dt * kappa
+        y = num / np.maximum(den, 1e-12)
+        return y
+
+    def _recompute_tau_pub_from_tau(self, tau_vec: np.ndarray) -> None:
+        # tau_pub = dt * a / (1 - a), a = exp(-dt/tau)
+        dt = float(self.cfg.dt)
+        a = np.exp(-dt / np.maximum(tau_vec, 1e-9))
+        denom = np.maximum(1.0 - a, 1e-12)
+        self.tau_pub_vec = np.clip(dt * a / denom,
+                                   float(self.cfg.tau_pub_min),
+                                   float(self.cfg.tau_pub_max))
 
     def get_tau_pub(self) -> np.ndarray:
         return self.tau_pub_vec.copy()
 
-    def update(self,
-               u_k: np.ndarray,
-               g_obs: Dict[str, np.ndarray],          # kept for signature; unused
-               omega_obs: Optional[Dict[str, np.ndarray]] = None,
-               # --- new optional inputs (minimal invasive) ---
-               kp_vec: Optional[np.ndarray] = None,
-               solver: Optional[object] = None,
-               theta_init: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def _local_angular_jacobian(self, theta: np.ndarray, frame_id: int) -> np.ndarray:
         """
-        Returns:
-            y_post: time-aligned internal command state (n,)
-            tau_vec: per-joint tau estimate derived from kappa
+        Try several method names to obtain LOCAL angular Jacobian of the frame.
+        Returns shape (3, n).
         """
-        u = np.asarray(u_k, dtype=float).reshape(self.n)
-        if not self.initialized:
-            self.reset(y0=u)
+        # common conventions:
+        # - 6xN spatial Jacobian: first 3 = angular, last 3 = linear OR vice versa
+        # - explicit angular local jacobian 3xN
+        J = None
+        # try common names in this codebase
+        # 1) frame_jacobian_local -> 6xN
+        if hasattr(self.robot, "frame_jacobian_local"):
+            J6 = self.robot.frame_jacobian_local(frame_id, theta)
+            if J6 is not None:
+                J6 = np.asarray(J6, dtype=float)
+                if J6.shape[0] == 6:
+                    # heuristics: angular usually on top rows in many libs
+                    # but some put angular at bottom; choose larger norm
+                    Jang_top = J6[0:3, :]
+                    Jang_bot = J6[3:6, :]
+                    if np.linalg.norm(Jang_top) >= np.linalg.norm(Jang_bot):
+                        J = Jang_top
+                    else:
+                        J = Jang_bot
+        # 2) angular_jacobian_local -> 3xN
+        if J is None and hasattr(self.robot, "angular_jacobian_local"):
+            J = np.asarray(self.robot.angular_jacobian_local(frame_id, theta), dtype=float)
+        # 3) generic jacobian_local -> maybe 6xN
+        if J is None and hasattr(self.robot, "jacobian_local"):
+            Jtmp = np.asarray(self.robot.jacobian_local(frame_id, theta), dtype=float)
+            if Jtmp.shape[0] == 6:
+                J = Jtmp[0:3, :]
+            elif Jtmp.shape[0] == 3:
+                J = Jtmp
+        if J is None:
+            # fallback: zeros (avoids crash; update will be gated by phi_norm)
+            J = np.zeros((3, self.n), dtype=float)
+        return J
 
-        dt = float(self.cfg.dt)
-        y_prev = self.x[:self.n].copy()
+    def _stack_W_local(self, theta_eq: np.ndarray) -> np.ndarray:
+        rows = []
+        for nm in self.frames:
+            fid = self.frame_ids.get(nm, None)
+            if fid is None:
+                rows.append(np.zeros((3, self.n), dtype=float))
+            else:
+                Jloc = self._local_angular_jacobian(theta_eq, fid)
+                rows.append(Jloc)
+        return np.vstack(rows) if rows else np.zeros((0, self.n), dtype=float)
 
-        # 1) advance y with current kappa (BE)
-        y_pred = self._be_step(y_prev, u, self.kappa, dt)
-        e = u - y_pred  # (n,)
-
-        # 2) build stacked LOCAL W_i(y_pred) and Omega_obs (IMU local)
-        if omega_obs is None or len(omega_obs) == 0:
-            y_post = y_pred
-            self.x[:self.n] = y_post
-            tau_vec = 1.0 / np.maximum(self.kappa, 1e-12)
-            tau_vec = np.clip(tau_vec,
-                              max(self.cfg.eps_tau, self.cfg.tau_min),
-                              (self.cfg.tau_max if self.cfg.tau_max > 0.0 else np.inf))
-            self.x[self.n:] = np.log(tau_vec)
-            self._update_tau_pub_from_tau(tau_vec)
-            self.u_prev = u.copy()
-            return y_post.copy(), tau_vec
-
-        # --- build W and Phi ---
-        use_sens = (kp_vec is not None) and (solver is not None)
-        if use_sens:
-            # 1) equilibrium at current y_pred
-            kp_vec = np.asarray(kp_vec, dtype=float).reshape(self.n)
-            th0 = (self.theta_eq_last if self.theta_eq_last is not None
-                   else (theta_init if theta_init is not None else y_pred))
-            try:
-                theta_eq = solver.solve(self.robot, theta_cmd=y_pred, kp_vec=kp_vec, theta_init=th0)
-            except Exception:
-                theta_eq = th0.copy()
-            self.theta_eq_last = theta_eq.copy()
-
-            # 2) sensitivity S = H^{-1} Kp,  H = d_tau_gravity(theta_eq) + diag(Kp)
-            try:
-                Htheta = self.robot.d_tau_gravity(theta_eq).astype(float)
-            except Exception:
-                Htheta = np.zeros((self.n, self.n), dtype=float)
-            H = Htheta + np.diag(kp_vec)
-            try:
-                Hinv = np.linalg.pinv(H, rcond=1e-10)
-            except Exception:
-                Hinv = np.linalg.pinv(H + 1e-6 * np.eye(self.n))
-            S = Hinv @ np.diag(kp_vec)   # (n x n)
-        else:
-            S = np.eye(self.n, dtype=float)
-
-        W = self._W_local_stack(theta_eq if use_sens else y_pred)  # LOCAL frame
-        # Apply gating / floor
-        e_eff = np.where(np.abs(e) < float(self.cfg.e_min), np.sign(e) * float(self.cfg.e_min), e)
-        Phi = W @ (S @ np.diag(e_eff))   # (3*m) x n
-
-        # 3) collect Omega from omega_obs
-        Om_list = []
+    def _stack_omega_vec(self, omega_obs: Optional[Dict[str, np.ndarray]]) -> Optional[np.ndarray]:
+        if omega_obs is None:
+            return None
+        vecs = []
         for nm in self.frames:
             w = omega_obs.get(nm, None)
             if w is None:
-                Om_list.append(np.zeros(3, dtype=float))
+                vecs.append(np.zeros((3,), dtype=float))
             else:
-                Om_list.append(np.asarray(w, dtype=float).reshape(3))
-        Omega = np.hstack(Om_list).reshape(-1)
+                w3 = np.asarray(w, dtype=float).reshape(3)
+                vecs.append(w3)
+        if not vecs:
+            return None
+        return np.hstack(vecs).reshape(-1)
 
-        # 4) robustify Omega and innovation
-        # 4) vector RLS over kappa (diag)
-        lam = float(self.cfg.rls_lambda)
+    # ---------- main update ----------
+    def update(self,
+               u_k: np.ndarray,
+               g_obs: Dict[str, np.ndarray],        # unused here (gyro-only RLS)
+               omega_obs: Optional[Dict[str, np.ndarray]],
+               kp_vec: np.ndarray,
+               solver: EquilibriumSolver,
+               theta_init: Optional[np.ndarray] = None
+               ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Run one step of BE propagation + vector RLS on kappa.
+        Returns (y_post, tau_vec).
+        """
+        u = np.asarray(u_k, dtype=float).reshape(-1)
+        assert u.size == self.n
+
+        # 1) predict y with current kappa (BE)
+        y_pred = self._propagate_y_BE(u, self.kappa)
+        e = u - y_pred
+
+        # 2) equilibrium at y_pred (time-consistent)
+        try:
+            theta0 = theta_init if theta_init is not None else y_pred
+            theta_eq = solver.solve(self.robot, theta_cmd=y_pred, kp_vec=kp_vec, theta_init=theta0)
+            self.last_theta_eq = theta_eq.copy()
+        except Exception:
+            theta_eq = self.last_theta_eq.copy() if (self.last_theta_eq is not None) else y_pred.copy()
+
+        # 3) build S = H^{-1} Kp at theta_eq
+        try:
+            Htheta = self.robot.d_tau_gravity(theta_eq).astype(float)
+        except Exception:
+            Htheta = np.zeros((self.n, self.n), dtype=float)
+        H = Htheta + np.diag(kp_vec)
+        try:
+            Hinv = np.linalg.pinv(H, rcond=1e-10)
+        except Exception:
+            Hinv = np.linalg.pinv(H + 1e-6 * np.eye(self.n))
+        S = Hinv @ np.diag(kp_vec)
+
+        # 4) Phi = W_local(theta_eq) * S * Diag(e)
+        W = self._stack_W_local(theta_eq)
+        Phi = W @ S @ np.diag(e)
+
+        # 5) stack Omega (LOCAL), optionally smooth by EMA
+        Omega = self._stack_omega_vec(omega_obs)
+        if Omega is None:
+            # nothing to update; keep prediction
+            y_post = y_pred.copy()
+            tau_vec = np.clip(1.0 / np.maximum(self.kappa, 1e-12),
+                              float(self.cfg.tau_min), float(self.cfg.tau_max))
+            self._recompute_tau_pub_from_tau(tau_vec)
+            self.y_prev = y_post.copy()
+            return y_post, tau_vec
+
+        if self.cfg.use_omega_ema:
+            a = float(np.clip(self.cfg.omega_alpha, 1e-3, 1.0))
+            self.omega_ema = (1.0 - a) * self.omega_ema + a * Omega
+            Omega_use = self.omega_ema
+        else:
+            Omega_use = Omega
+
+        # 6) vector RLS on kappa with optional tricks
         P = self.Pt.copy()
         theta = self.kappa.copy()
-        
-        # EMA on Omega
-        a_ema = float(np.clip(self.cfg.omega_alpha, 1e-3, 1.0))
-        self.omega_ema = (1.0 - a_ema) * self.omega_ema + a_ema * Omega
-        Omega_use = self.omega_ema
 
-        # S_k = lam*I + Phi P Phi^T (+ ridge)
-        S_k = lam * np.eye(Phi.shape[0], dtype=float) + Phi @ P @ Phi.T + float(self.cfg.rls_ridge) * np.eye(Phi.shape[0])
-        try:
-            Sinv = np.linalg.pinv(S_k, rcond=1e-10)
-        except Exception:
-            Sinv = np.linalg.pinv(S_k + 1e-6 * np.eye(S_k.shape[0]))
-        K = P @ Phi.T @ Sinv
-        # Innovation (Huber-like clipping): Omega_use - Phi theta
-        innov = Omega_use - (Phi @ theta)
-        clip_mag = float(max(self.cfg.innov_clip, 0.0))
-        if clip_mag > 0.0:
-            innov = np.clip(innov, -clip_mag, clip_mag)
+        # gating
+        do_update = True
+        if self.cfg.use_gating:
+            if np.linalg.norm(e) < float(self.cfg.e_min):
+                do_update = False
+            if np.linalg.norm(Phi) < float(self.cfg.phi_norm_min):
+                do_update = False
 
-        theta_new = theta + K @ innov
+        if do_update:
+            Phi_use = Phi.copy()
+            Om_use = Omega_use.copy()
 
-        # projection to physical bounds (tau bounds -> kappa bounds)
-        kappa_new = np.clip(theta_new, self.kappa_min, self.kappa_max)
+            # normalization
+            if self.cfg.use_normalize:
+                scale = np.sqrt(float(self.cfg.norm_epsilon) + float(np.sum(Phi_use * Phi_use)))
+                Phi_use = Phi_use / scale
+                Om_use = Om_use / scale
 
-        # covariance: P = lambda^{-1} (I - K Phi) P
-        I_n = np.eye(self.n, dtype=float)
-        P_new = (I_n - K @ Phi) @ P
-        P_new = (1.0 / lam) * P_new
+            # forgetting
+            lam = float(self.cfg.rls_lambda) if self.cfg.use_forgetting else 1.0
 
-        # commit parameters + cov
-        self.kappa = kappa_new
-        self.Pt = 0.5 * (P_new + P_new.T)  # symmetrize
+            # innovation (with optional clip)
+            innov = Om_use - Phi_use @ theta
+            if self.cfg.use_innov_clip and float(self.cfg.innov_clip) > 0.0:
+                c = float(self.cfg.innov_clip)
+                innov = np.clip(innov, -c, c)
 
-        # 5) final y with updated kappa
-        y_post = self._be_step(y_prev, u, self.kappa, dt)
+            # RLS gain and update
+            S_k = lam * np.eye(Phi_use.shape[0], dtype=float) + Phi_use @ P @ Phi_use.T \
+                  + float(self.cfg.rls_ridge) * np.eye(Phi_use.shape[0], dtype=float)
+            try:
+                Sinv = np.linalg.pinv(S_k, rcond=1e-10)
+            except Exception:
+                Sinv = np.linalg.pinv(S_k + 1e-6 * np.eye(S_k.shape[0], dtype=float))
+            K = P @ Phi_use.T @ Sinv
+            theta_new = theta + K @ innov
+            P_new = (1.0 / lam) * (np.eye(self.n, dtype=float) - K @ Phi_use) @ P
 
-        # 6) expose public state
-        self.x[:self.n] = y_post
-        tau_vec = 1.0 / np.maximum(self.kappa, 1e-12)
-        tau_vec = np.clip(tau_vec,
-                          max(self.cfg.eps_tau, self.cfg.tau_min),
-                          (self.cfg.tau_max if self.cfg.tau_max > 0.0 else np.inf))
-        self.x[self.n:] = np.log(tau_vec)
+            # projection (keep tau within [tau_min, tau_max])
+            if self.cfg.use_projection:
+                tau_new = 1.0 / np.maximum(theta_new, 1e-12)
+                tau_new = np.clip(tau_new, float(self.cfg.tau_min), float(self.cfg.tau_max))
+                theta_new = 1.0 / np.maximum(tau_new, 1e-12)
 
-        # Note: no state covariance (self.P) is maintained in this RLS-only class; legacy update removed.
+            self.kappa = theta_new
+            self.Pt = P_new
 
-        # update per-joint pub tau suggestion
-        self._update_tau_pub_from_tau(tau_vec)
+        # 7) re-propagate y with updated kappa (consistency) and export
+        y_post = self._propagate_y_BE(u, self.kappa)
+        tau_vec = np.clip(1.0 / np.maximum(self.kappa, 1e-12),
+                          float(self.cfg.tau_min), float(self.cfg.tau_max))
+        self._recompute_tau_pub_from_tau(tau_vec)
 
-        self.u_prev = u.copy()
-        return y_post.copy(), tau_vec
+        # 8) keep last y
+        self.y_prev = y_post.copy()
+        return y_post, tau_vec

@@ -34,6 +34,8 @@ from online_deflecomp.controller.command import theta_cmd_from_theta_ref
 from online_deflecomp.controller.equilibrium import EquilibriumSolver, EquilibriumConfig
 from online_deflecomp.estimator.ekf import MultiFrameWeirdEKF
 from online_deflecomp.estimator.cmd_lag_ekf import CmdLagEKF, CmdLagEKFConfig
+
+from online_deflecomp.utils.bingham import NoiseCovarianceHelper
  
 # ---------------- helpers ----------------
 def angle_wrap(x: np.ndarray) -> np.ndarray:
@@ -244,6 +246,10 @@ class EstimatorNode:
         self.pub_tpub = rospy.Publisher("/online_deflecomp/tau_pub", Float64MultiArray, queue_size=10)
 
         # Control params
+        # --- TODO(kappa-noise): keep base Q for WEKF noise adaptation ---
+        # We will synthesize Q_eff each cycle: Q_eff = Q_base + Q_add(kappa_cov)
+        self.q_proc_base = float(q_proc)
+
         self.dt = float(dt)
         self.inv_denom_min = float(inv_denom_min)
         self.rate_limit = float(rate_limit)
@@ -258,6 +264,8 @@ class EstimatorNode:
         self.k_counter = 0
         self.t0 = time.perf_counter()
 
+        # --- TODO(kappa-noise): we need previous y_hat to form dy/dkappa Jacobian ---
+        self.last_y_hat: Optional[np.ndarray] = None
         # Timer
         self.timer = rospy.Timer(rospy.Duration.from_sec(self.dt), self.on_timer)
         rospy.loginfo("estimator_node: frames=%s", ", ".join(self.frames))
@@ -330,11 +338,108 @@ class EstimatorNode:
         t_cmdlag1 = time.perf_counter()
         self.pub_tau.publish(Float64MultiArray(data=tau_vec.tolist()))
 
+        # ---------------------------------------------------------------------
+        # (2.5) kappa-progress driven noise adaptation (revived)
+        # ---------------------------------------------------------------------
+        # Goal: inflate WEKF observation and process noise when kappa estimate
+        #       is still uncertain, and relax them as P_kappa shrinks.
+        #
+        # Theory (linear spring version for WEKF consistency):
+        #   J_ykappa = diag( dt*(u - y_prev) / (1 + dt*kappa)^2 )
+        #   S_theta  = (d tau_g/dtheta + diag(K))^{-1} * diag(K)
+        #   Sigma_theta = S_theta * J_ykappa * P_kappa * J_ykappa^T * S_theta^T
+        #   Q_eff = Q_base + beta * J_x^T * (J_q^{-1} * Sigma_theta * J_q^{-T}) * J_x
+        #   A_f  <- A_f + c_kappa * I_4   (unit quaternion: z^T(A + cI)z = z^T A z + c)
+        # Notes:
+        #   * We compute all at a linearization pose 'theta_lin' available *now*.
+        #     Use last equilibrium if available, else y_hat (time-aligned cmd).
+        #   * If CmdLagEKF exposes P through a different name, update the 'try' section.
+        # ---------------------------------------------------------------------
+        # --- TODO(kappa-noise): fetch kappa covariance from CmdLagEKF ---
+        try:
+            P_kappa = self.cmdlag.P.copy()                  # expected RLS covariance (n x n)
+        except Exception:
+            # Fallback: conservative diagonal (kept large so that adaptation is visible)
+            P_kappa = np.eye(self.n) * 1e+1                 # TODO(kappa-noise): wire to real cov if name differs
+
+        # Build dy/dkappa (per-joint) at current step
+        kappa_vec = 1.0 / np.maximum(tau_vec, 1e-6)
+        y_prev = self.last_y_hat if (self.last_y_hat is not None) else y_hat
+        J_yk = (self.dt * (u_k - y_prev)) / np.square(1.0 + self.dt * kappa_vec)
+        J_ykappa = np.diag(J_yk.reshape(-1))
+
+        # Linearization for WEKF consistency (no cos softening here)
+        theta_lin = self.wekf.last_theta_eq if (self.wekf.last_theta_eq is not None) else y_hat
+        try:
+            Htheta_lin = self.robot.d_tau_gravity(theta_lin).astype(float)
+        except Exception:
+            Htheta_lin = np.zeros((self.n, self.n), dtype=float)
+        K_lin = self.kp_hat_smooth if (self.kp_hat_smooth is not None) else np.exp(self.wekf.x)
+        J_q_lin = Htheta_lin + np.diag(K_lin)
+        # S_theta = J_q^{-1} * diag(K)
+        try:
+            J_q_inv = np.linalg.pinv(J_q_lin, rcond=1e-10)
+        except Exception:
+            J_q_inv = np.linalg.pinv(J_q_lin + 1e-6 * np.eye(self.n))
+        S_theta = J_q_inv @ np.diag(K_lin)
+        Sigma_theta = S_theta @ J_ykappa @ P_kappa @ J_ykappa.T @ S_theta.T
+
+        # --- TODO(kappa-noise): observation inflation scalar from Sigma_theta ---
+        # Use scalar proxy: tr(Sigma_theta); tune alpha_R later if needed.
+        alpha_R = 1.0   # TODO(kappa-noise): retune/CLI if necessary
+        c_kappa = float(alpha_R * np.trace(Sigma_theta))
+
+        # --- TODO(kappa-noise): process noise augmentation for WEKF ---
+        delta_lin = (theta_lin - y_hat)          # consistent with linear spring used in WEKF
+        J_x_lin = np.diag(K_lin * delta_lin)
+        beta_Q = 1.0   # TODO(kappa-noise): retune/CLI if necessary
+        Q_add = beta_Q * (J_x_lin.T @ (J_q_inv @ Sigma_theta @ J_q_inv.T) @ J_x_lin)
+        Q_eff = np.eye(self.n) * self.q_proc_base + Q_add
+        Q_eff = 0.5 * (Q_eff + Q_eff.T)
+        # Numerical floor on diagonal for PSD robustness
+        diag_min = 1e-10
+        dQ = np.clip(np.diag(Q_eff), diag_min, None)
+        np.fill_diagonal(Q_eff, dQ)
+
         # (3) Build A_map from IMU gravity observations (for Bingham WEKF)
         A_map: Dict[int, np.ndarray] = {}
         for nm, g_f in g_obs.items():
             if nm in self.frame_ids:
-                A_map[self.frame_ids[nm]] = simple_bingham_unit(g_f, self.g_unit, self.A_param)
+                fid = self.frame_ids[nm]
+                # --- TODO(kappa-noise): per-frame C_theta at the linearization pose (theta_lin) ---
+                # C_theta_f = Qz_f(theta_lin) @ J_w_f(theta_lin)
+                #   Qz_f: 4x4 quaternion "G" matrix from frame->world quat (wxyz)
+                #   J_w_f: 4x3? actually 3xN world angular-vel jacobian; robot API returns (3 x n)
+                #   We use Qz_f (4x4) only to map quat derivatives; for gravity Bingham, the effective
+                #   observation Jacobian wrt joint angles is (3 x n) = J_w_f. The lifted form used in
+                #   WEKF derivation is C_theta_f = Qz_f @ J_w_f (4 x n), and the covariance projection
+                #   for gravity direction residual lives in the 3D subspace; NoiseCovarianceHelper
+                #   expects a 3x3 covariance, so we project via J_w_f only.
+                # z_lin = self.robot.frame_quaternion_wxyz_base(theta_lin, fid)
+                # Qz_lin = BinghamUtils.qmat_from_quat_wxyz(z_lin)
+                J_w_lin = self.robot.frame_angular_jacobian_world(theta_lin, fid)  # (3 x n)
+                # --- TODO(kappa-noise): strict lifted form would be (Qz_lin @ J_w_lin), but for the
+                # gravity-direction residual the 3D projection via J_w_lin is sufficient and matches
+                # the helper signature (3x3 covariance).
+                Sigma_obs = J_w_lin @ Sigma_theta @ J_w_lin.T          # (3 x 3) = C_theta Σ_theta C_theta^T
+                Sigma_add = np.eye(3, dtype=float) * 1e-9              # TODO(kappa-noise): base sensor noise
+                Sigma_in = np.eye(3, dtype=float) * 2e-2 + Sigma_obs
+                A_raw = NoiseCovarianceHelper.calc_bingham_A(g_f, self.g_unit, Sigma_in, Sigma_add)
+
+                # print("A_raw")
+                # print(np.linalg.eigh(A_raw))
+                # --- TODO(kappa-noise): optional scalar inflation c_kappa I_4 (unit quat: z^T(A+cI)z = z^T A z + c) ---
+                # A_map[fid] = A_raw  # + (c_kappa * np.eye(4, dtype=float))
+                A_map[fid] = simple_bingham_unit(g_f, self.g_unit, self.A_param)
+
+                # print("simple_bingham_unit(g_f, self.g_unit, self.A_param)")
+                # print(np.linalg.eigh(simple_bingham_unit(g_f, self.g_unit, self.A_param)))
+
+                # print(A_raw / simple_bingham_unit(g_f, self.g_unit, self.A_param))
+                
+                # print(-4 * A_map[fid] / self.A_param)
+                # print(NoiseCovarianceHelper.get_Hmat(g_f, self.g_unit).T @ NoiseCovarianceHelper.get_Hmat(g_f, self.g_unit))
+
         had_A_map = 1 if len(A_map) > 0 else 0
 
         # (4) EKF update for Kp using time-aligned y_hat
@@ -342,6 +447,13 @@ class EstimatorNode:
         theta_init = self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else y_hat
         wekf_updated = 0
         if A_map:
+            # --- TODO(kappa-noise): push Q_eff into WEKF before predict() inside update_with_multi ---
+            # MultiFrameWeirdEKF.predict() uses self.Q; set it here every cycle.
+            try:
+                self.wekf.Q = Q_eff.copy()
+            except Exception:
+                # Safety: if WEKF ever wraps Q inside a config, keep old behavior
+                self.wekf.Q = np.eye(self.n) * self.q_proc_base
             theta_eq = self.wekf.update_with_multi(
                 self.solver, y_hat, A_map, self.robot,
                 theta_init_eq_pred=theta_init, kp_lim=self.kp_lim
@@ -439,7 +551,7 @@ class EstimatorNode:
         self.last_cmd_t = now
 
         # -------- debug prints (numeric-only) --------
-        if (k % self.dbg_interval) == 0:
+        if False and (k % self.dbg_interval) == 0:
             t_step1 = time.perf_counter()
             ms_cmdlag = (t_cmdlag1 - t_cmdlag0) * 1000.0
             ms_wekf = (t_wekf1 - t_wekf0) * 1000.0

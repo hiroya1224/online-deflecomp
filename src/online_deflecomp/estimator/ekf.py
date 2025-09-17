@@ -4,16 +4,55 @@ from ..utils.robot import RobotArm
 from ..utils.bingham import BinghamUtils
 from ..controller.equilibrium import EquilibriumSolver
 
+# --- helpers for square-root (QR) EKF ---
+def _sym(A: np.ndarray) -> np.ndarray:
+    return 0.5 * (A + A.T)
+
+def _chol_psd(A: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Return upper-triangular R such that R.T @ R ≈ A (PSD with small floor).
+    """
+    A = _sym(A.astype(float))
+    try:
+        L = np.linalg.cholesky(A)  # A = L @ L.T
+        return L.T                 # R = upper
+    except np.linalg.LinAlgError:
+        w, V = np.linalg.eigh(A)
+        w = np.maximum(w, eps)
+        A_spd = (V * w) @ V.T
+        L = np.linalg.cholesky(A_spd)
+        return L.T
+
+def _qrr_upper(A: np.ndarray) -> np.ndarray:
+    """
+    Return the R from reduced QR of A (upper-triangular).
+    """
+    _, R = np.linalg.qr(A, mode="reduced")
+    return R
+
+def _solve_upper(R: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Solve R x = b for upper-triangular R.
+    """
+    return np.linalg.solve(R, b)
+
+
 class MultiFrameWeirdEKF:
     def __init__(self, x0: np.ndarray, P0: np.ndarray, Q: np.ndarray, eps_def: float = 1e-6) -> None:
         self.x = x0.copy()
-        self.P = P0.copy()
+        # keep square-root covariance
+        self.R = _chol_psd(P0)              # P0 = R.T @ R
+        self.P = self.R.T @ self.R          # maintain for compatibility
         self.Q = Q.copy()
         self.eps_def = float(eps_def)
         self.last_theta_eq: Optional[np.ndarray] = None
 
     def predict(self) -> None:
-        self.P = self.P + self.Q
+        # Square-root prediction for random-walk: P+Q via qrr([R; chol(Q)])
+        Uq = _chol_psd(self.Q)
+        A = np.vstack([self.R, Uq])
+        self.R = _qrr_upper(A)
+        self.P = self.R.T @ self.R  # keep compatibility
 
     @staticmethod
     def _common_terms(robot: RobotArm, theta_eq: np.ndarray, theta_cmd: np.ndarray, k_diag: np.ndarray):
@@ -87,29 +126,44 @@ class MultiFrameWeirdEKF:
         g, H, theta_eq, c_bingham = self._grad_hess_multi(solver=solver, x0=self.x, theta_cmd=theta_cmd, A_map=A_map, robot_est=robot_est, theta_init=theta_init_eq_pred)
         Sinv = -H
         w = np.linalg.eigvalsh(0.5 * (Sinv + Sinv.T))
+        print("eigval of Sinv = ", w)
         lam_min = float(np.min(w))
         if lam_min <= self.eps_def:
             Sinv = Sinv + ((self.eps_def - lam_min) + 1e-12) * np.eye(Sinv.shape[0])
 
-        # S = np.linalg.pinv(Sinv, rcond=1e-12)
-        # m = self.x + S @ g
-
-        Pinv = np.linalg.pinv(self.P, rcond=1e-12)
-        # J_post = Pinv + Sinv
-        # P_post = np.linalg.pinv(J_post, rcond=1e-12)
-        # h_post = Pinv @ self.x + Sinv @ m
-        # x_post = P_post @ h_post
-
-        # 等価な一行更新（丸め誤差的にも綺麗）
-        # lam = ||x - x_prev|| を小さくする regularize factor
-        lam = 1e-6
-        P_post = np.linalg.pinv(Pinv + Sinv + lam*np.eye(Sinv.shape[0]), rcond=1e-12)
-        x_post = self.x + P_post @ g
+        print("eigval of Sinv shifted = ", np.linalg.eigh(Sinv)[0])
+        # --- Square-Root (QR) update (information form) ---
+        # Sinv = S.T @ S (SPD by stabilization)
+        S = _chol_psd(Sinv, eps=1e-12)
+        y = np.linalg.solve(S.T, g.reshape(-1, 1))  # (n x 1), S.T @ y = g
+        n = self.R.shape[0]
+        # information square-root of Pinv: W = R^{-T}
+        Rinv = _solve_upper(self.R, np.eye(n))      # R @ Rinv = I  -> Rinv = R^{-1}
+        W = Rinv.T
+        # small Tikhonov regularization (consistent with previous impl)
+        # lam = 0.
+        # if lam > 0.0:
+        #     L = np.sqrt(lam) * np.eye(n)
+        #     A = np.vstack([W, S, L])
+        #     b = np.vstack([np.zeros((n, 1)), y, np.zeros((n, 1))])
+        # else:
+        A = np.vstack([W, S])
+        b = np.vstack([np.zeros((n, 1)), y])
+        # QR least-squares
+        Q, Rbar = np.linalg.qr(A, mode="reduced")   # A = Q Rbar
+        bbar = Q.T @ b
+        dx = _solve_upper(Rbar, bbar)               # solves (Pinv + Sinv + lam I) dx = g
+        x_post = (self.x.reshape(-1, 1) + dx).reshape(-1)
+        # posterior covariance square-root: R_post = Rbar^{-1}
+        R_post = _solve_upper(Rbar, np.eye(n))
+        self.R = R_post
+        self.P = self.R.T @ self.R  # keep compatibility
 
         ## clip
         x_post = np.clip(x_post, np.log(kp_lim[0]), np.log(kp_lim[1]))
 
-        self.P = 0.5 * (P_post + P_post.T)
+        print("x_post = ", x_post)
+
         self.x = x_post
         self.last_theta_eq = theta_eq.copy()
         return theta_eq

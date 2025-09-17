@@ -7,6 +7,13 @@ import numpy as np
 from online_deflecomp.utils.robot import RobotArm
 from online_deflecomp.controller.equilibrium import EquilibriumSolver
 
+# --- QR-based linear solver: solves A X = B via QR without forming A^{-1} ---
+def _qr_solve(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    # A: (m x m), B: (m x k). Uses reduced QR for speed/stability.
+    # Assumes A is reasonably well-conditioned after ridge/lam terms.
+    Q, R = np.linalg.qr(A, mode="reduced")
+    return np.linalg.solve(R, Q.T @ B)
+
 # ----------------------------
 # Config with per-feature toggles
 # ----------------------------
@@ -201,7 +208,7 @@ class CmdLagEKF:
         # 2) equilibrium at y_pred (time-consistent)
         try:
             theta0 = theta_init if theta_init is not None else y_pred
-            theta_eq = solver.solve(self.robot, theta_cmd=y_pred, kp_vec=kp_vec, theta_init=theta0)
+            theta_eq = solver.solve_rti(self.robot, theta_cmd=y_pred, kp_vec=kp_vec, theta_init=theta0)             
             self.last_theta_eq = theta_eq.copy()
         except Exception:
             theta_eq = self.last_theta_eq.copy() if (self.last_theta_eq is not None) else y_pred.copy()
@@ -278,14 +285,17 @@ class CmdLagEKF:
 
             # RLS gain and update
             S_k = lam * np.eye(Phi_use.shape[0], dtype=float) + Phi_use @ P @ Phi_use.T \
-                  + float(self.cfg.rls_ridge) * np.eye(Phi_use.shape[0], dtype=float)
-            try:
-                Sinv = np.linalg.pinv(S_k, rcond=1e-10)
-            except Exception:
-                Sinv = np.linalg.pinv(S_k + 1e-6 * np.eye(S_k.shape[0], dtype=float))
-            K = P @ Phi_use.T @ Sinv
-            theta_new = theta + K @ innov
-            P_new = (1.0 / lam) * (np.eye(self.n, dtype=float) - K @ Phi_use) @ P
+                 + float(self.cfg.rls_ridge) * np.eye(Phi_use.shape[0], dtype=float)
+            # QR-based solves (no explicit inverse)
+            innov_col = innov.reshape(-1, 1)
+            # z = S_k^{-1} * innov
+            z = _qr_solve(S_k, innov_col)                     # (m x 1)
+            # T = S_k^{-1} * Phi_use
+            T = _qr_solve(S_k, Phi_use)                       # (m x n)
+            # theta update: theta_new = theta + P * Phi^T * z
+            theta_new = (theta + (P @ Phi_use.T @ z).reshape(-1))
+            # covariance update: P_new = (1/lam) * (P - P * Phi^T * T * P)
+            P_new = (1.0 / lam) * (P - (P @ Phi_use.T @ T @ P))
 
             # projection (keep tau within [tau_min, tau_max])
             if self.cfg.use_projection:

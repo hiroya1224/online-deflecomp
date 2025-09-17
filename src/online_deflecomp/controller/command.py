@@ -2,9 +2,21 @@ import numpy as np
 from ..utils.robot import RobotArm
 
 def theta_cmd_from_theta_ref(robot: RobotArm, theta_ref: np.ndarray, kp_vec: np.ndarray) -> np.ndarray:
-    tau_g = robot.tau_gravity(theta_ref)
-    kp_safe = np.maximum(kp_vec, 1e-12)
-    return theta_ref + (tau_g / kp_safe)
+   """Closed-form S^1-consistent feedforward command.
+
+   Solves at equilibrium (quasi-static):
+       tau_spring = -tau_gravity(theta_ref)
+       tau_spring = 2*Kp*sin((theta_ref - theta_cmd)/2)
+    => theta_cmd = theta_ref - 2*asin( -tau_g(theta_ref)/(2*Kp) )
+
+   This avoids iterative inverse solving and remains well-behaved near +-pi.
+   """
+   tau_g = robot.tau_gravity(theta_ref)
+   kp_safe = np.maximum(kp_vec, 1e-12)
+   asin_arg = -tau_g / (2.0 * kp_safe)
+   # physical saturation; keep continuity by tight margins
+   asin_arg = np.clip(asin_arg, -1.0 + 1e-9, 1.0 - 1e-9)
+   return theta_ref - 2.0 * np.arcsin(asin_arg)
 
 def lowpass_theta_cmd(theta_raw: np.ndarray,
                       theta_prev: np.ndarray,

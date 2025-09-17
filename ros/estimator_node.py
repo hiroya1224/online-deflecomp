@@ -508,7 +508,7 @@ def main() -> None:
     ap.add_argument("--A", type=float, default=100.0)
     ap.add_argument("--kp0", type=str, default="50,50,50,50,50,50")
     ap.add_argument("--kp-min", type=float, default=5)
-    ap.add_argument("--kp-max", type=float, default=500)
+    ap.add_argument("--kp-max", type=float, default=100)
     ap.add_argument("--q-proc", type=float, default=1e-3)
 
     # control layer

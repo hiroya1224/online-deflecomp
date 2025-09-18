@@ -37,6 +37,25 @@ def _solve_upper(R: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     return np.linalg.solve(R, b)
 
+# --- TODO(sinv-box): SPD projection with spectral bounds for numerical elegance ---
+def _project_spd_bounds(M: np.ndarray, eig_min: float, eig_max: Optional[float]) -> np.ndarray:
+    """
+    Project symmetric M onto SPD with eigenvalue box [eig_min, eig_max].
+    If eig_max is None, only floor is applied.
+    """
+    A = _sym(M.astype(float))
+    try:
+        w, V = np.linalg.eigh(A)
+    except Exception:
+        # tiny ridge then eigh
+        A = A + (abs(eig_min) + 1e-12) * np.eye(A.shape[0], dtype=float)
+        w, V = np.linalg.eigh(A)
+    if eig_max is not None:
+        w = np.clip(w, eig_min, eig_max)
+    else:
+        w = np.maximum(w, eig_min)
+    return (V * w) @ V.T
+
 
 class MultiFrameWeirdEKF:
     def __init__(self, x0: np.ndarray, P0: np.ndarray, Q: np.ndarray, eps_def: float = 1e-6) -> None:
@@ -49,6 +68,9 @@ class MultiFrameWeirdEKF:
         self.last_theta_eq: Optional[np.ndarray] = None
         # filled each update_with_multi() call with ms breakdowns
         self.last_timing: Optional[Dict[str, float]] = None
+        # --- TODO(sinv-box): ceiling for information eigenvalues (tunable) ---
+        # This caps "how confident" a single update can be; prevents huge Sinv.
+        self.sinv_eig_max: float = 1.0e8  # adjust later if needed
 
     def predict(self) -> None:
         # Square-root prediction for random-walk: P+Q via qrr([R; chol(Q)])
@@ -187,6 +209,14 @@ class MultiFrameWeirdEKF:
         if lam_min <= self.eps_def:
             Sinv = Sinv + ((self.eps_def - lam_min) + 1e-12) * np.eye(Sinv.shape[0])
         t_eig1 = time.perf_counter()
+
+        # --- TODO(sinv-box): spectral boxing to avoid tiny negatives & huge eigenvalues ---
+        # Floor: >= eps_def; Ceiling: <= self.sinv_eig_max (tunable, keeps chol/QR well-conditioned)
+        # try:
+        Sinv = _project_spd_bounds(Sinv, eig_min=max(self.eps_def, 1e-9), eig_max=self.sinv_eig_max)
+        # except Exception:
+        #     # last-resort: add small ridge only
+        #     Sinv = Sinv + 1e-9 * np.eye(Sinv.shape[0], dtype=float)
 
         # Square-root (QR) update -- information form
         # Sinv = S.T @ S (SPD by stabilization)

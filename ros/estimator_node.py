@@ -279,7 +279,15 @@ class EstimatorNode:
         else:
             v = np.array(fb_tau_des, dtype=float).reshape(-1)
             self.fb_tau_des = v if v.size == self.n else np.full((self.n,), float(v[0]), dtype=float)
-
+        # --- Safety envelope params (publish layer only) ---
+        # TODO(safety): expose via CLI after確認
+        self.follow_alpha = 1.5     # allow cmd to move up to 1.5x ref speed per step
+        self.follow_eps   = 0.02    # [rad] small allowance even when ref is still
+        self.leash_base   = 0.5     # [rad] base leash half-width around theta_ref
+        self.leash_rate_gain  = 0.5 # [ - ] adds with |Δtheta_ref|
+        self.leash_trust_gain = 0.7 # [rad] extra leash when WEKF is confident
+        self.leash_info_scale = 1.0 # [ - ] scales info/(info+scale)
+        self.leash_hard_max   = 2.0 # [rad] absolute leash cap
         # Debug
         self.dbg_interval = max(1, int(dbg_interval))
         self.k_counter = 0
@@ -294,6 +302,11 @@ class EstimatorNode:
     # -------- callbacks --------
     def cb_ref(self, msg: JointState) -> None:
         q = map_jointstate_to_model(msg, self.model_joint_names)
+        # Keep previous ref for rate-synchronized limiter
+        if hasattr(self, "q_ref") and self.have_ref:
+            self.q_ref_prev = self.q_ref.copy()
+        else:
+            self.q_ref_prev = q.copy()
         self.q_ref = q.copy()
         self.have_ref = True
 
@@ -356,7 +369,8 @@ class EstimatorNode:
             omega_obs=w_obs if w_obs else None,
             kp_vec=kp_for_lag,
             solver=self.solver,
-            theta_init=(self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else None)
+            # theta_init=(self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else None)
+            theta_init=(self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else self.q_ref)
         )
         t_cmdlag1 = time.perf_counter()
         self.pub_tau.publish(Float64MultiArray(data=tau_vec.tolist()))
@@ -379,11 +393,11 @@ class EstimatorNode:
         #   * If CmdLagEKF exposes P through a different name, update the 'try' section.
         # ---------------------------------------------------------------------
         # --- TODO(kappa-noise): fetch kappa covariance from CmdLagEKF ---
-        try:
-            P_kappa = self.cmdlag.Pt.copy()                  # expected RLS covariance (n x n)
-        except Exception:
-            # Fallback: conservative diagonal (kept large so that adaptation is visible)
-            P_kappa = np.eye(self.n) * 1e+1                 # TODO(kappa-noise): wire to real cov if name differs
+        # try:
+        P_kappa = self.cmdlag.Pt.copy()                  # expected RLS covariance (n x n)
+        # except Exception:
+        #     # Fallback: conservative diagonal (kept large so that adaptation is visible)
+        #     P_kappa = np.eye(self.n) * 1e+1                 # TODO(kappa-noise): wire to real cov if name differs
 
         # Build dy/dkappa (per-joint) at current step
         kappa_vec = 1.0 / np.maximum(tau_vec, 1e-6)
@@ -500,7 +514,8 @@ class EstimatorNode:
 
         # (4) EKF update for Kp using time-aligned y_hat
         t_wekf0 = time.perf_counter()
-        theta_init = self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else y_hat
+        # theta_init = self.wekf.last_theta_eq if self.wekf.last_theta_eq is not None else 
+        theta_init = self.wekf.last_theta_eq if (self.wekf.last_theta_eq is not None) else self.q_ref
         wekf_updated = 0
         if A_map:
             # --- TODO(kappa-noise): push Q_eff into WEKF before predict() inside update_with_multi ---
@@ -545,10 +560,10 @@ class EstimatorNode:
         c_eff = np.clip(c_half, 1e-3, 1.0)
         K_eff = self.kp_hat_smooth * c_eff
         H = Htheta + np.diag(K_eff)
-        try:
-            Hinv = np.linalg.pinv(H, rcond=1e-10)
-        except Exception:
-            Hinv = np.linalg.pinv(H + 1e-6 * np.eye(self.n))
+        # try:
+        Hinv = np.linalg.pinv(H, rcond=1e-10)
+        # except Exception:
+        #     Hinv = np.linalg.pinv(H + 1e-6 * np.eye(self.n))
         S = Hinv @ np.diag(K_eff)
 
         # plant pole a
@@ -564,10 +579,10 @@ class EstimatorNode:
         denom_prod = np.maximum((1.0 - a_vec) * (1.0 - a_pub_vec), self.inv_denom_min)
         gamma_vec = (a_vec + a_pub_vec - 2.0 * sqrt_aa) / denom_prod
 
-        try:
-            Sinv = np.linalg.pinv(S, rcond=1e-10)
-        except Exception:
-            Sinv = np.linalg.pinv(S + 1e-6 * np.eye(self.n))
+        # try:
+        Sinv = np.linalg.pinv(S, rcond=1e-10)
+        # except Exception:
+        #     Sinv = np.linalg.pinv(S + 1e-6 * np.eye(self.n))
         L = (np.diag(gamma_vec) @ Sinv)
         t_eq1 = time.perf_counter()
 
@@ -577,7 +592,7 @@ class EstimatorNode:
         theta_err = angle_wrap(theta_eq - self.q_ref)
         u_cmd_raw = u_star - (L @ theta_err)
 
-        # (8) publish LPF: u_k = a_p * u_{k-1} + (1-a_p) * u_raw, then rate limit
+        # (8) publish LPF: u_k = a_p * u_{k-1} + (1-a_p) * u_raw
         if self.last_cmd is not None:
             # unwrap raw command to be continuous w.r.t. last published value
             u_cmd_raw = angle_unwrap_to_ref(u_cmd_raw, self.last_cmd)
@@ -587,10 +602,36 @@ class EstimatorNode:
             u_lpf = u_cmd_raw.copy()
             du = u_lpf.copy()
 
-        max_step = self.rate_limit * self.dt
-        du_lim = np.clip(du, -max_step, max_step)
-        rate_hit = 1 if np.any(np.abs(du) > max_step + 1e-12) else 0
+        # --- (8b) Reference-synchronized rate limiter (per joint) ---
+        # Allow cmd to move proportionally to |Δtheta_ref| (plus small epsilon), but never beyond HW cap.
+        if self.have_ref and hasattr(self, "q_ref_prev") and self.q_ref_prev is not None:
+            dref = angle_wrap(self.q_ref - self.q_ref_prev)  # per-joint wrapped delta
+        else:
+            dref = np.zeros_like(u_lpf)
+        follow_step = self.follow_alpha * np.abs(dref) + self.follow_eps
+        hw_step = self.rate_limit * self.dt
+        allow_step = np.minimum(hw_step, follow_step)
+        du_lim = np.clip(du, -allow_step, allow_step)
+        # flags for debug
+        rate_hit  = 1 if np.any(np.abs(du) > hw_step  + 1e-12) else 0
+        follow_hit = 1 if np.any(np.abs(du) > allow_step + 1e-12) else 0
         u_cmd = (self.last_cmd + du_lim) if (self.last_cmd is not None) else u_lpf.copy()
+
+        # --- (8c) Reference leash (moderate divergence guard, S^1-consistent) ---
+        # Trust from WEKF covariance: info = 1/diag(P), mapped to [0,1] by info/(info+scale).
+        # Lower trust => tighter leash. Adds a small rate-dependent slack to avoid over-constraining.
+        try:
+            info_vec = 1.0 / (np.diag(self.wekf.P).astype(float) + 1e-9)
+        except Exception:
+            info_vec = np.ones(self.n, dtype=float)
+        trust = info_vec / (info_vec + self.leash_info_scale)
+        dmax = self.leash_base + self.leash_rate_gain * np.abs(dref) + self.leash_trust_gain * trust
+        dmax = np.clip(dmax, 0.1, self.leash_hard_max)
+        # clamp around theta_ref with shortest-arc arithmetic
+        rel = angle_wrap(u_cmd - self.q_ref)
+        rel_clamped = np.clip(rel, -dmax, dmax)
+        leash_hit = 1 if np.any(np.abs(rel) > dmax + 1e-12) else 0
+        u_cmd = angle_unwrap_to_ref(self.q_ref + rel_clamped, u_cmd if self.last_cmd is None else self.last_cmd)
 
         # (9) publish
         out = JointState()
@@ -607,7 +648,7 @@ class EstimatorNode:
         self.last_cmd_t = now
 
         # -------- debug prints (numeric-only) --------
-        if (k % self.dbg_interval) == 0:
+        if False and (k % self.dbg_interval) == 0:
             t_step1 = time.perf_counter()
             # --- TODO(kappa-noise-dbg): extra diagnostics for root-cause isolation ---
             # cond(J_q_lin), tr(P_kappa), tr(Sigma_theta), SL consistency error, asin saturation proxy, Q_eff stats
@@ -776,6 +817,21 @@ class EstimatorNode:
             print(",".join([str(6), str(k)] + [f"{v:.6e}" for v in y_hat.tolist() + tau_vec.tolist()]))
             # 7: u_star
             print(",".join([str(7), str(k)] + [f"{v:.6e}" for v in u_star.tolist()]))
+            print(",".join([str(7), str(k)] + [f"{v:.6e}" for v in u_star.tolist()]))
+            # 16: safety envelope telemetry
+            try:
+                follow_step_min = float(np.min(follow_step)); follow_step_max = float(np.max(follow_step))
+                allow_step_min  = float(np.min(allow_step));  allow_step_max  = float(np.max(allow_step))
+                dmax_min = float(np.min(dmax)); dmax_max = float(np.max(dmax))
+            except Exception:
+                follow_step_min = follow_step_max = allow_step_min = allow_step_max = dmax_min = dmax_max = float("nan")
+            print(",".join(str(x) for x in [
+                16, k,
+                f"{follow_step_min:.6e}", f"{follow_step_max:.6e}",
+               f"{allow_step_min:.6e}",  f"{allow_step_max:.6e}",
+                f"{dmax_min:.6e}",       f"{dmax_max:.6e}",
+                follow_hit, leash_hit
+            ]))
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -801,7 +857,7 @@ def main() -> None:
     ap.add_argument("--dbg-interval", type=int, default=1)
 
     # --- RLS feature toggles (cmd_lag_ekf) --- (defaults updated per request)
-    ap.add_argument("--rls-lambda", type=float, default=0.9)
+    ap.add_argument("--rls-lambda", type=float, default=0.8)
     ap.add_argument("--rls-use-forgetting", action="store_true", default=True)
     ap.add_argument("--rls-no-forgetting", dest="rls_use_forgetting", action="store_false")
 

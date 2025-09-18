@@ -14,6 +14,26 @@ def _qr_solve(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     Q, R = np.linalg.qr(A, mode="reduced")
     return np.linalg.solve(R, Q.T @ B)
 
+# --- PSD projection helper (eigenvalue floor/ceiling) ---
+def _project_psd_bounds(M: np.ndarray, eig_min: float = 1e-12, eig_max: Optional[float] = None) -> np.ndarray:
+    """
+    Project symmetric M onto the PSD cone with spectral bounds:
+      M_proj = V * clip(eig(M), [eig_min, eig_max]) * V^T.
+    If eig_max is None, only floor is applied.
+    """
+    A = 0.5 * (M + M.T)
+    try:
+        w, V = np.linalg.eigh(A)
+    except Exception:
+        # Fallback: small ridge then eigh
+        A = A + (abs(eig_min) + 1e-12) * np.eye(A.shape[0], dtype=float)
+        w, V = np.linalg.eigh(A)
+    if eig_max is not None:
+        w = np.clip(w, eig_min, eig_max)
+    else:
+        w = np.maximum(w, eig_min)
+    return (V * w) @ V.T
+
 # ----------------------------
 # Config with per-feature toggles
 # ----------------------------
@@ -258,11 +278,11 @@ class CmdLagEKF:
 
         # gating
         do_update = True
-        if self.cfg.use_gating:
-            if np.linalg.norm(e) < float(self.cfg.e_min):
-                do_update = False
-            if np.linalg.norm(Phi) < float(self.cfg.phi_norm_min):
-                do_update = False
+        # if self.cfg.use_gating:
+        #     if np.linalg.norm(e) < float(self.cfg.e_min):
+        #         do_update = False
+        #     if np.linalg.norm(Phi) < float(self.cfg.phi_norm_min):
+        #         do_update = False
 
         if do_update:
             Phi_use = Phi.copy()
@@ -296,6 +316,11 @@ class CmdLagEKF:
             theta_new = (theta + (P @ Phi_use.T @ z).reshape(-1))
             # covariance update: P_new = (1/lam) * (P - P * Phi^T * T * P)
             P_new = (1.0 / lam) * (P - (P @ Phi_use.T @ T @ P))
+
+            # 情報形の床（情報下限の注入）
+            zeta = 1e-3  # TODO: 物理幅から決める
+            Pinv = np.linalg.pinv(P_new, rcond=1e-12)
+            P_new = np.linalg.pinv(Pinv + zeta*np.eye(P.shape[0]), rcond=1e-12)
 
             # projection (keep tau within [tau_min, tau_max])
             if self.cfg.use_projection:

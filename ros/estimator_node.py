@@ -81,6 +81,27 @@ def simple_bingham_unit(frame_g_dir: np.ndarray, world_g_unit: np.ndarray, A_par
     P = Lmat(xq) - Rmat(vq)
     return float(A_param) * (-0.25 * (P.T @ P))
 
+# --- PSD projection helper (eigenvalue floor/ceiling) ---
+def _project_psd_bounds(M: np.ndarray, eig_min: float = 1e-12, eig_max: Optional[float] = None) -> np.ndarray:
+    """
+    Project symmetric M onto the PSD cone with spectral bounds:
+      M_proj = V * clip(eig(M), [eig_min, eig_max]) * V^T.
+    If eig_max is None, only floor is applied.
+    """
+    A = 0.5 * (M + M.T)
+    try:
+        w, V = np.linalg.eigh(A)
+    except Exception:
+        # Fallback: small ridge then eigh
+        A = A + (abs(eig_min) + 1e-12) * np.eye(A.shape[0], dtype=float)
+        w, V = np.linalg.eigh(A)
+    if eig_max is not None:
+        w = np.clip(w, eig_min, eig_max)
+    else:
+        w = np.maximum(w, eig_min)
+    return (V * w) @ V.T
+
+
 @dataclass
 class ImuBuffer:
     t_list: List[float]
@@ -308,6 +329,7 @@ class EstimatorNode:
         now = rospy.Time.now().to_sec()
 
         # (0) collect IMU observations at 'now'
+        t_imu0 = time.perf_counter()
         g_obs: Dict[str, np.ndarray] = {}
         w_obs: Dict[str, np.ndarray] = {}
         for nm in self.frames:
@@ -318,6 +340,7 @@ class EstimatorNode:
                 w_obs[nm] = w_f
         n_g = len(g_obs); n_w = len(w_obs)
 
+        t_imu1 = time.perf_counter()
         # (1) current published command u_k for lag propagation
         if self.last_cmd is not None:
             u_k = self.last_cmd.copy()
@@ -357,7 +380,7 @@ class EstimatorNode:
         # ---------------------------------------------------------------------
         # --- TODO(kappa-noise): fetch kappa covariance from CmdLagEKF ---
         try:
-            P_kappa = self.cmdlag.P.copy()                  # expected RLS covariance (n x n)
+            P_kappa = self.cmdlag.Pt.copy()                  # expected RLS covariance (n x n)
         except Exception:
             # Fallback: conservative diagonal (kept large so that adaptation is visible)
             P_kappa = np.eye(self.n) * 1e+1                 # TODO(kappa-noise): wire to real cov if name differs
@@ -368,26 +391,42 @@ class EstimatorNode:
         J_yk = (self.dt * (u_k - y_prev)) / np.square(1.0 + self.dt * kappa_vec)
         J_ykappa = np.diag(J_yk.reshape(-1))
 
-        # Linearization for WEKF consistency (no cos softening here)
+        # ---------------------------------------------------------------------
+        # Linearization for Σ_theta (kappa -> theta uncertainty propagation)
+        # NOTE: This block is ONLY for Sigma_theta. Controller S and WEKF Hessian
+        #       remain with linear K elsewhere. Here we use physically-meaningful
+        #       effective stiffness K_eff = K * cos( (theta - theta_cmd)/2 ),
+        #       so Σ_theta does not blow up when the equilibrium weakens near ±pi.
+        # ---------------------------------------------------------------------
         theta_lin = self.wekf.last_theta_eq if (self.wekf.last_theta_eq is not None) else y_hat
         try:
             Htheta_lin = self.robot.d_tau_gravity(theta_lin).astype(float)
         except Exception:
             Htheta_lin = np.zeros((self.n, self.n), dtype=float)
+        # Base stiffness (linear spring for consistency with WEKF elsewhere)
         K_lin = self.kp_hat_smooth if (self.kp_hat_smooth is not None) else np.exp(self.wekf.x)
-        J_q_lin = Htheta_lin + np.diag(K_lin)
-        # S_theta = J_q^{-1} * diag(K)
+        # --- TODO(kappa-noise): effective stiffness ONLY for Sigma_theta ---
+        delta_nl = (theta_lin - y_hat)                     # theta_cmd ~ y_hat (time-aligned)
+        c_half = np.cos(0.5 * delta_nl)
+        c_eff = np.clip(c_half, 1e-3, 1.0)                 # numerical floor; physical softening near ±pi
+        K_eff = K_lin * c_eff
+        # J_q for Sigma_theta path
+        J_q_lin = Htheta_lin + np.diag(K_eff)
+        # S_theta = J_q^{-1} * diag(K_eff)
         try:
+            # Minimal change: keep pinv but on the effective J_q.
+            # TODO(kappa-noise): consider Tikhonov regularization if needed:
+            #   J_q_inv = np.linalg.solve(J_q_lin.T @ J_q_lin + rho*I, J_q_lin.T)
             J_q_inv = np.linalg.pinv(J_q_lin, rcond=1e-10)
         except Exception:
             J_q_inv = np.linalg.pinv(J_q_lin + 1e-6 * np.eye(self.n))
-        S_theta = J_q_inv @ np.diag(K_lin)
+        S_theta = J_q_inv @ np.diag(K_eff)
         Sigma_theta = S_theta @ J_ykappa @ P_kappa @ J_ykappa.T @ S_theta.T
 
         # --- TODO(kappa-noise): observation inflation scalar from Sigma_theta ---
         # Use scalar proxy: tr(Sigma_theta); tune alpha_R later if needed.
-        alpha_R = 1.0   # TODO(kappa-noise): retune/CLI if necessary
-        c_kappa = float(alpha_R * np.trace(Sigma_theta))
+        # alpha_R = 1.0   # TODO(kappa-noise): retune/CLI if necessary
+        # c_kappa = float(alpha_R * np.trace(Sigma_theta))
 
         # --- TODO(kappa-noise): process noise augmentation for WEKF ---
         delta_lin = (theta_lin - y_hat)          # consistent with linear spring used in WEKF
@@ -401,7 +440,23 @@ class EstimatorNode:
         dQ = np.clip(np.diag(Q_eff), diag_min, None)
         np.fill_diagonal(Q_eff, dQ)
 
+        # ------------------------------------------------------------------
+        # TODO(kappa-noise): Physics-based spectral ceiling for Q_eff
+        # x = log(K) random walk. Assume a maximum diffusion rate:
+        #   sigma_xdot_max [1/s]  => per-step std <= sigma_xdot_max * dt
+        # Thus eigenvalue cap: eig(Q_eff) <= (sigma_xdot_max * dt)^2
+        # ------------------------------------------------------------------
+        sigma_xdot_max = 20.0  # [1/s]  TODO(kappa-noise): tune / expose via CLI
+        q_eig_max = (sigma_xdot_max * self.dt) ** 2
+        q_eig_min = 1e-12      # numerical floor (already applied above; keep consistent)
+        try:
+            Q_eff = _project_psd_bounds(Q_eff, eig_min=q_eig_min, eig_max=q_eig_max)
+        except Exception:
+            # In worst case, keep the floored version without ceiling.
+            pass
+
         # (3) Build A_map from IMU gravity observations (for Bingham WEKF)
+        t_amap0 = time.perf_counter()
         A_map: Dict[int, np.ndarray] = {}
         for nm, g_f in g_obs.items():
             if nm in self.frame_ids:
@@ -441,6 +496,7 @@ class EstimatorNode:
                 # print(NoiseCovarianceHelper.get_Hmat(g_f, self.g_unit).T @ NoiseCovarianceHelper.get_Hmat(g_f, self.g_unit))
 
         had_A_map = 1 if len(A_map) > 0 else 0
+        t_amap1 = time.perf_counter()
 
         # (4) EKF update for Kp using time-aligned y_hat
         t_wekf0 = time.perf_counter()
@@ -461,7 +517,7 @@ class EstimatorNode:
             wekf_updated = 1
         else:
             try:
-                theta_eq = self.solver.solve(self.robot, theta_cmd=y_hat, kp_vec=np.exp(self.wekf.x), theta_init=theta_init)
+                theta_eq = self.solver.solve_rti(self.robot, theta_cmd=y_hat, kp_vec=np.exp(self.wekf.x), theta_init=theta_init)
                 self.wekf.last_theta_eq = theta_eq.copy()
             except Exception:
                 theta_eq = theta_init.copy()
@@ -551,10 +607,45 @@ class EstimatorNode:
         self.last_cmd_t = now
 
         # -------- debug prints (numeric-only) --------
-        if False and (k % self.dbg_interval) == 0:
+        if (k % self.dbg_interval) == 0:
             t_step1 = time.perf_counter()
+            # --- TODO(kappa-noise-dbg): extra diagnostics for root-cause isolation ---
+            # cond(J_q_lin), tr(P_kappa), tr(Sigma_theta), SL consistency error, asin saturation proxy, Q_eff stats
+            try:
+                condJq = float(np.linalg.cond(J_q_lin))  # from (2.5) block
+            except Exception:
+                condJq = float("nan")
+            try:
+                trPkappa = float(np.trace(self.cmdlag.Pt))
+            except Exception:
+                trPkappa = float("nan")
+            try:
+                trSigma = float(np.trace(Sigma_theta))
+            except Exception:
+                trSigma = float("nan")
+            try:
+                SL_err = float(np.linalg.norm((S @ (np.diag(gamma_vec) @ np.linalg.pinv(S))), ord=2))
+            except Exception:
+                # Fallback: ||S@L - diag(gamma)||_F
+                try:
+                    SL_err = float(np.linalg.norm(S @ (np.diag(gamma_vec) @ np.linalg.pinv(S)) - np.diag(gamma_vec)))
+                except Exception:
+                    SL_err = float("nan")
+            # asin saturation proxy (requires tau_gravity; guarded)
+            try:
+                tau_g_ref = self.robot.tau_gravity(self.q_ref).reshape(-1)
+                asin_arg = -tau_g_ref / (2.0 * np.maximum(self.kp_hat_smooth, 1e-12))
+                asin_min, asin_max = float(np.min(asin_arg)), float(np.max(asin_arg))
+                asin_sat = float(np.mean(np.abs(asin_arg) > 1.0))
+            except Exception:
+                asin_min = asin_max = asin_sat = float("nan")
+
             ms_cmdlag = (t_cmdlag1 - t_cmdlag0) * 1000.0
             ms_wekf = (t_wekf1 - t_wekf0) * 1000.0
+            # extra: where do we spend outside WEKF?
+            ms_imu = (t_imu1 - t_imu0) * 1000.0
+            ms_amap = (t_amap1 - t_amap0) * 1000.0
+
             ms_eq = (t_eq1 - t_eq0) * 1000.0
             ms_total = (t_step1 - t_step0) * 1000.0
             t_rel = t_step1 - self.t0
@@ -572,6 +663,18 @@ class EstimatorNode:
                 normSinv = float(np.linalg.norm(Sinv))
             # for ID=2: reuse fields with new semantics (see header)
             beta_eff_vec = np.sqrt(a_vec * a_pub_vec)
+            # --- TODO(kappa-noise-dbg): Q_eff stats if available ---
+            try:
+                qeff_diag = np.diag(Q_eff)
+                qeff_min = float(np.min(qeff_diag)); qeff_max = float(np.max(qeff_diag))
+                qeff_tr  = float(np.trace(Q_eff))
+            except Exception:
+                qeff_min = qeff_max = qeff_tr = float("nan")
+            # --- TODO(kappa-noise-dbg): extra norms ---
+            try:
+                du_inf = float(np.max(np.abs(u_cmd_raw - (self.last_cmd if self.last_cmd is not None else 0.0))))
+            except Exception:
+                du_inf = float("nan")
             beta_min = float(np.min(beta_eff_vec)); beta_max = float(np.max(beta_eff_vec))
             lfac_min = float(np.min(gamma_vec)); lfac_max = float(np.max(gamma_vec))
             a_min = float(np.min(a_vec)); a_max = float(np.max(a_vec))
@@ -600,6 +703,71 @@ class EstimatorNode:
                 f"{norm_theta_err:.6e}", f"{norm_du_raw:.6e}", f"{norm_du_lim:.6e}",
                 rate_hit, 0, 0
             ]))
+            # 8: kappa-driven noise adaptation summary
+            #    fields: tr(P_kappa), tr(Sigma_theta), cond(J_q_lin), qeff_tr, qeff_min, qeff_max
+            print(",".join(str(x) for x in [
+                8, k,
+                f"{trPkappa:.6e}", f"{trSigma:.6e}", f"{condJq:.6e}",
+                f"{qeff_tr:.6e}", f"{qeff_min:.6e}", f"{qeff_max:.6e}"
+            ]))
+            # 9: SL consistency / asin saturation proxy / limiter
+            #    fields: SL_err, asin_min, asin_max, asin_sat_frac, du_inf, rate_hit
+            print(",".join(str(x) for x in [
+                9, k,
+                f"{SL_err:.6e}", f"{asin_min:.6e}", f"{asin_max:.6e}", f"{asin_sat:.6e}",
+                f"{du_inf:.6e}", rate_hit
+            ]))
+            # 10: per-joint asin_arg (if available), else NaN vector length n
+            try:
+                asin_list = [f"{v:.6e}" for v in asin_arg.tolist()]
+            except Exception:
+                asin_list = [f"{float('nan'):.6e}" for _ in range(self.n)]
+            print(",".join([str(10), str(k)] + asin_list))
+            # 11: Q_eff diagonal (if available)
+            try:
+                qeff_list = [f"{v:.6e}" for v in np.diag(Q_eff).tolist()]
+            except Exception:
+                qeff_list = [f"{float('nan'):.6e}" for _ in range(self.n)]
+            print(",".join([str(11), str(k)] + qeff_list))
+            # 12: y_kappa Jacobian diag and S_theta diag proxies (scale / sanity)
+            try:
+                Jyk_list = [f"{v:.6e}" for v in np.diag(J_ykappa).tolist()]
+            except Exception:
+                Jyk_list = [f"{float('nan'):.6e}" for _ in range(self.n)]
+            try:
+                Stheta_diag = np.diag(S_theta) if 'S_theta' in locals() else np.full((self.n,), float("nan"))
+                Stheta_list = [f"{v:.6e}" for v in Stheta_diag.tolist()]
+            except Exception:
+                Stheta_list = [f"{float('nan'):.6e}" for _ in range(self.n)]
+
+            # 13: WEKF internal timing breakdown (ms)
+            try:
+                wt = self.wekf.last_timing if (self.wekf.last_timing is not None) else {}
+                fields = [
+                    wt.get("pred_ms", float("nan")),
+                    wt.get("eq_solve_ms", float("nan")),
+                    wt.get("accum_ms", float("nan")),
+                    wt.get("pinv_JqT_ms", float("nan")),
+                    wt.get("stab_eig_ms", float("nan")),
+                    wt.get("eig_Sinv_ms", float("nan")),
+                    wt.get("chol_Sinv_ms", float("nan")),
+                    wt.get("solve_St_y_ms", float("nan")),
+                    wt.get("solve_Rinv_ms", float("nan")),
+                    wt.get("qr_A_ms", float("nan")),
+                    wt.get("solve_Rbar_ms", float("nan")),
+                    wt.get("inv_Rbar_ms", float("nan")),
+                    wt.get("wekf_update_ms", float("nan")),
+                ]
+            except Exception:
+                fields = [float("nan")] * 13
+            print(",".join([str(13), str(k)] + [f"{v:.3f}" for v in fields]))
+            # 14: IMU/A_map timing (ms) — helps to rule out I/O/interp vs math
+            print(",".join(str(x) for x in [
+                14, k,
+                f"{ms_imu:.3f}", f"{ms_amap:.3f}"
+            ]))
+
+            print(",".join([str(12), str(k)] + Jyk_list + Stheta_list))
             # 4: vectors (theta_ref, theta_eq, u_cmd)
             print(",".join([str(4), str(k)] + [f"{v:.6e}" for v in self.q_ref.tolist() + theta_eq.tolist() + u_cmd.tolist()]))
             # 5: a/beta/gamma vectors -> (a_vec, a_pub_vec, beta_eff_vec, gamma_vec)
@@ -618,7 +786,7 @@ def main() -> None:
     ap.add_argument("--topic-cmd-out", type=str, default="/cmd/joint_states")
     ap.add_argument("--dt", type=float, default=0.02)
     ap.add_argument("--A", type=float, default=100.0)
-    ap.add_argument("--kp0", type=str, default="50,50,50,50,50,50")
+    ap.add_argument("--kp0", type=str, default="100,100,100,100,100,100")
     ap.add_argument("--kp-min", type=float, default=5)
     ap.add_argument("--kp-max", type=float, default=100)
     ap.add_argument("--q-proc", type=float, default=1e-3)

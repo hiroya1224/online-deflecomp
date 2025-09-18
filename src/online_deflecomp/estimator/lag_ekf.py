@@ -110,7 +110,7 @@ class LagEKF:
         # 1) equilibrium at current u
         theta0 = theta_init if theta_init is not None else self.u
         try:
-            theta_eq = solver.solve(robot, theta_cmd=self.u, kp_vec=kp_vec, theta_init=theta0)
+            theta_eq = solver.solve_rti(robot, theta_cmd=self.u, kp_vec=kp_vec, theta_init=theta0)
         except Exception:
             theta_eq = theta0.copy()
         self.theta_eq_last = theta_eq.copy()

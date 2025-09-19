@@ -13,6 +13,11 @@ class EquilibriumConfig:
 
 class EquilibriumSolver:
     def __init__(self, cfg: Optional[EquilibriumConfig] = None) -> None:
+        # caches for RTI one-shot corrector
+        self.theta_prev = None
+        self.H_prev = None
+        self.kp_prev = None
+        self.theta_cmd_prev = None
         self.cfg = cfg or EquilibriumConfig()
         self.eq_path_last: List[np.ndarray] = []
 
@@ -102,3 +107,37 @@ class EquilibriumSolver:
             x0, theta_opt = self._stage_minimize(robot, theta_cmd, k_eff_diag, x0)
             self.eq_path_last.append(theta_opt.copy())
         return theta_opt
+
+    def solve_rti(self, robot, theta_cmd: np.ndarray, kp_vec: np.ndarray, theta_init: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Real-Time Iteration (one-shot corrector) equilibrium solve.
+        Uses previous linearization; falls back to one evaluation when caches are empty.
+        """
+        # initialize previous theta
+        if self.theta_prev is None:
+            self.theta_prev = theta_init.copy() if theta_init is not None else theta_cmd.copy()
+        # build H at previous theta using nonlinear effective stiffness
+        Htheta = robot.d_tau_gravity(self.theta_prev).astype(float)
+        d_nl = (self.theta_prev - theta_cmd)  # no explicit wrap
+        c_half = np.cos(0.5 * d_nl)
+        # small physical floor keeps H well-conditioned near +-pi
+        c_eff = np.clip(c_half, 1e-3, 1.0)
+        K_eff = kp_vec * c_eff
+        H = Htheta + np.diag(K_eff)
+        # residual at previous theta
+        tau_g = robot.tau_gravity(self.theta_prev)
+        tau_spring = 2.0 * kp_vec * np.sin(0.5 * (self.theta_prev - theta_cmd))
+        r = tau_g + tau_spring
+        # corrector step (one linear solve)
+        try:
+            delta = -np.linalg.solve(H, r)
+        except Exception:
+            # fallback to pinv if singular
+            delta = -np.linalg.pinv(H, rcond=1e-10) @ r
+        theta_eq = self.theta_prev + delta
+        # refresh caches for next cycle
+        self.theta_prev = theta_eq.copy()
+        self.H_prev = H
+        self.kp_prev = kp_vec.copy()
+        self.theta_cmd_prev = theta_cmd.copy()
+        return theta_eq

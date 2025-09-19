@@ -527,7 +527,7 @@ class EstimatorNode:
                 self.wekf.Q = np.eye(self.n) * self.q_proc_base
             theta_eq = self.wekf.update_with_multi(
                 self.solver, y_hat, A_map, self.robot,
-                theta_init_eq_pred=theta_init, kp_lim=self.kp_lim
+                theta_init_eq_pred=self.q_ref, kp_lim=self.kp_lim
             )
             wekf_updated = 1
         else:
@@ -648,7 +648,7 @@ class EstimatorNode:
         self.last_cmd_t = now
 
         # -------- debug prints (numeric-only) --------
-        if False and (k % self.dbg_interval) == 0:
+        if True and (k % self.dbg_interval) == 0:
             t_step1 = time.perf_counter()
             # --- TODO(kappa-noise-dbg): extra diagnostics for root-cause isolation ---
             # cond(J_q_lin), tr(P_kappa), tr(Sigma_theta), SL consistency error, asin saturation proxy, Q_eff stats

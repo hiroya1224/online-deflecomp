@@ -65,6 +65,8 @@ class MultiFrameWeirdEKF:
         self.P = self.R.T @ self.R          # maintain for compatibility
         self.Q = Q.copy()
         self.eps_def = float(eps_def)
+        # NOTE(info-cap): upper bound for spectral radius of Sinv per update (uniform tempering)
+        self.sinv_eig_cap = 1.0  # TODO(expose): make CLI-configurable if必要
         self.last_theta_eq: Optional[np.ndarray] = None
         # filled each update_with_multi() call with ms breakdowns
         self.last_timing: Optional[Dict[str, float]] = None
@@ -229,7 +231,15 @@ class MultiFrameWeirdEKF:
         t_rhs0 = time.perf_counter()
         y = np.linalg.solve(S.T, g.reshape(-1, 1))  # (n x 1)
         t_rhs1 = time.perf_counter()
-
+        # --- uniform tempering of measurement information (geometry-preserving) ---
+        # cap spectral radius without per-eigen clipping: scale S and y by sqrt(alpha)
+        w2 = np.linalg.eigvalsh(0.5 * (Sinv + Sinv.T))
+        lam_max = float(np.max(w2)) if w2.size > 0 else 0.0
+        if lam_max > self.sinv_eig_cap:
+            alpha = max(self.sinv_eig_cap / max(lam_max, 1e-12), 1e-6)
+            scale = float(np.sqrt(alpha))
+            S = S * scale
+            y = y * scale
         n = self.R.shape[0]
 
         # information square-root of Pinv: W = R^{-T}
